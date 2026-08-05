@@ -24,6 +24,13 @@ site/
 app/static/
 deploy/helm/*/charts/
 
+# Native XA Windows application build state
+xa-app/build/
+xa-app/deps/
+xa-app/release/
+xa-app/backups/
+xa-app/crash_log_*.log
+
 # Node
 node_modules/
 frontend/node_modules/
@@ -39,9 +46,13 @@ frontend/coverage/
 *~
 
 # Local
+xa/
+backups/
+docs/
 .local/
 .worktrees/
 certs/
+*archive/
 
 .codex-lb/
 .sisyphus/

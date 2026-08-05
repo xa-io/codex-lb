@@ -1,0 +1,12 @@
+{
+  "webview2": {
+    "package": "Microsoft.Web.WebView2",
+    "version": "1.0.4078.44",
+    "url": "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.4078.44",
+    "sha256": "DC4D1D9168DF26B830398303E50210B6E1729F6CE5A7AC69D2C766852F489962"
+  },
+  "pyinstaller": {
+    "version": "6.21.0"
+  }
+}
+
