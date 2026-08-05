@@ -26,6 +26,21 @@ def test_native_host_uses_owned_shutdown_event_and_webview2() -> None:
     assert "taskkill" not in source.casefold()
 
 
+def test_native_owned_backend_disables_http_responses_session_bridge() -> None:
+    source = (XA_APP / "src" / "main.cpp").read_text(encoding="utf-8")
+    child_environment_start = source.index(
+        "const std::map<std::wstring, std::wstring> childEnvironment"
+    )
+    self_test_start = source.index("if (g_app.options.selfTest)", child_environment_start)
+    ordinary_child_environment = source[child_environment_start:self_test_start]
+    bridge_override = (
+        '{L"CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED", L"false"}'
+    )
+
+    assert bridge_override in ordinary_child_environment
+    assert source.count("CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED") == 1
+
+
 def test_native_host_uses_static_webview_loader_and_static_msvc_runtime() -> None:
     cmake = (XA_APP / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "WebView2LoaderStatic.lib" in cmake

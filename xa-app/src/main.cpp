@@ -417,6 +417,7 @@ bool StartOwnedBackend(std::wstring& error) {
     const std::map<std::wstring, std::wstring> childEnvironment = {
         {L"PORT", std::to_wstring(g_app.options.port)},
         {L"CODEX_LB_DATA_DIR", g_app.dataDir.wstring()},
+        {L"CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED", L"false"},
     };
     for (const auto& [name, value] : childEnvironment) {
         saved.push_back(SaveEnvironment(name));
@@ -426,7 +427,6 @@ bool StartOwnedBackend(std::wstring& error) {
         const std::map<std::wstring, std::wstring> testEnvironment = {
             {L"CODEX_LB_AUTH_GUARDIAN_ENABLED", L"false"},
             {L"CODEX_LB_AUTOMATIONS_SCHEDULER_ENABLED", L"false"},
-            {L"CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED", L"false"},
             {L"CODEX_LB_LEADER_ELECTION_ENABLED", L"false"},
             {L"CODEX_LB_LIVE_USAGE_INGESTION_ENABLED", L"false"},
             {L"CODEX_LB_MODEL_REGISTRY_ENABLED", L"false"},

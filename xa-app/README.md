@@ -28,6 +28,7 @@ Required local tools are Python/uv, Bun, CMake, Visual Studio 2022 Build Tools w
 - `backend\codex-lb-backend.exe` is the hidden packaged form of the upstream Python/FastAPI server.
 - If a healthy codex-lb service is already listening on the selected port, the app reuses it and leaves it running when the window closes.
 - Otherwise the app starts an owned backend, signals a graceful shutdown when the window closes, and uses a Windows Job Object only as a crash failsafe.
+- An owned bundled backend disables the internal HTTP Responses session bridge and uses codex-lb's direct HTTP streaming/retry path. A reused service keeps its existing configuration.
 
 The normal data directory is `%USERPROFILE%\.codex-lb`. It contains the application database, encryption key, logs, and WebView2 profile. The release never includes `auth.json`, `store.db`, or `encryption.key`.
 
