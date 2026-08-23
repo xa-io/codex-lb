@@ -39,4 +39,3 @@ unmerged and its bridge integration checks are not green.
 - **External services:** a healthy service already listening on the selected
   port is reused without configuration changes.
 - **Build:** no dependency, database, packaging, or version change is required.
-

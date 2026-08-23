@@ -37,4 +37,3 @@ native host starts its packaged backend with the session bridge disabled. A
 Codex request to `/backend-api/codex/responses` still selects the configured
 account and streams normally through the direct HTTP path, without creating an
 HTTP bridge session or entering its cooldown circuit.
-

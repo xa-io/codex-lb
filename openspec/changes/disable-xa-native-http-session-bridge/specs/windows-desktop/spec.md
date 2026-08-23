@@ -22,4 +22,3 @@ codex-lb service that it reuses instead of starting.
 - **WHEN** the operator launches the XA native application
 - **THEN** the native window reuses that service
 - **AND** it does not alter the reused service's session-bridge configuration
-
