@@ -22,7 +22,12 @@ def _clear_recent_count_cache_between_tests():
 
 
 @pytest.mark.asyncio
-async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
+async def test_add_log_ignores_closed_transaction(monkeypatch, db_setup) -> None:
+    # The insert now executes eagerly (Core insert instead of a unit-of-work
+    # flush inside commit), so the schema must exist; the contract under test
+    # is unchanged: a ResourceClosedError commit is swallowed and the built
+    # log row is still returned.
+    del db_setup
     async with SessionLocal() as session:
         repo = RequestLogsRepository(session)
 
@@ -52,7 +57,7 @@ async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_add_log_persists_request_kind(db_setup) -> None:
+async def test_add_log_persists_request_and_connection_kinds(db_setup) -> None:
     del db_setup
     async with SessionLocal() as session:
         repo = RequestLogsRepository(session)
@@ -67,11 +72,13 @@ async def test_add_log_persists_request_kind(db_setup) -> None:
             status="success",
             error_code=None,
             request_kind="warmup",
+            connection_request_kind="prewarm",
         )
 
         persisted = await session.scalar(select(RequestLog).where(RequestLog.id == saved.id))
         assert persisted is not None
         assert persisted.request_kind == "warmup"
+        assert persisted.connection_request_kind == "prewarm"
 
 
 @pytest.mark.asyncio

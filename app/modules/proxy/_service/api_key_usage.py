@@ -14,6 +14,7 @@ from app.core.errors import openai_error
 from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
 from app.core.openai.models import CompactResponsePayload
 from app.core.utils.request_id import get_request_id
+from app.db.models import Account
 from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyInvalidError,
@@ -25,6 +26,7 @@ from app.modules.api_keys.service import (
 from app.modules.proxy._service.support import (
     _ApiKeyReservationTouchState,
     _consume_api_key_reservation_heartbeat_result,
+    _signal_propagated_responses_service_cleanup_ready,
     _StreamSettlement,
     _WebSocketRequestState,
 )
@@ -33,6 +35,9 @@ from app.modules.proxy.repo_bundle import ProxyRepoFactory
 logger = logging.getLogger("app.modules.proxy.service")
 
 _API_KEY_RESERVATION_HEARTBEAT_SECONDS = 300.0
+_STREAM_API_KEY_RELEASE_RETRY_BASE_SECONDS = 0.1
+_STREAM_API_KEY_RELEASE_RETRY_MAX_SECONDS = 5.0
+_STREAM_API_KEY_RELEASE_RETRY_MAX_CONCURRENCY = 4
 
 
 def _service_api_keys_service() -> type[ApiKeysService]:
@@ -60,6 +65,8 @@ def _api_key_reservation_heartbeat_seconds() -> float:
 class _ApiKeyUsageServiceProtocol(Protocol):
     _repo_factory: ProxyRepoFactory
     _background_cleanup_tasks: set[asyncio.Task[None]]
+    _stream_api_key_release_retry_semaphore: asyncio.Semaphore
+    _load_balancer: Any
 
 
 def _normalize_service_tier_value(value: Any) -> str | None:
@@ -131,6 +138,30 @@ class _ApiKeyUsageMixin:
     ) -> None:
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
         await self._release_websocket_reservation(request_state.api_key_reservation)
+        request_state.api_key_reservation = None
+        lifecycle = request_state.deferred_account_backoff_lifecycle
+        if lifecycle is not None:
+            lifecycle.settlement_confirmed = True
+        pending_backoffs = (
+            lifecycle.pending_backoffs if lifecycle is not None else request_state.deferred_account_error_backoffs
+        )
+        if pending_backoffs:
+            await self._drain_deferred_account_error_backoffs(pending_backoffs)
+
+    async def _drain_deferred_account_error_backoffs(
+        self,
+        pending_backoffs: dict[str, Account],
+    ) -> None:
+        if not pending_backoffs:
+            return
+        proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        while pending_backoffs:
+            account_id, account = pending_backoffs.popitem()
+            try:
+                await proxy._load_balancer.record_error_backoff(account)
+            except BaseException:
+                pending_backoffs.setdefault(account_id, account)
+                raise
 
     async def _maybe_touch_api_key_reservation(
         self,
@@ -276,6 +307,7 @@ class _ApiKeyUsageMixin:
         )
 
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        reservation_released = False
         with anyio.CancelScope(shield=True):
             try:
                 async with proxy._repo_factory() as repos:
@@ -291,6 +323,7 @@ class _ApiKeyUsageMixin:
                         )
                     else:
                         await api_keys_service.release_usage_reservation(reservation_id)
+                reservation_released = True
             except Exception as exc:
                 logger.warning(
                     "Failed to settle compact API key reservation key_id=%s request_id=%s",
@@ -302,6 +335,7 @@ class _ApiKeyUsageMixin:
                     async with proxy._repo_factory() as repos:
                         api_keys_service = _service_api_keys_service()(repos.api_keys)
                         await api_keys_service.release_usage_reservation(reservation_id)
+                    reservation_released = True
                 except Exception:
                     logger.warning(
                         "Failed to release compact API key reservation after settlement failure "
@@ -320,7 +354,38 @@ class _ApiKeyUsageMixin:
                     failure_phase="usage_settlement",
                     failure_detail="compact_api_key_usage_persistence_failed",
                     failure_exception_type=type(exc).__name__,
+                    reservation_released=reservation_released,
                 ) from exc
+            finally:
+                _signal_propagated_responses_service_cleanup_ready()
+
+    async def settle_image_api_key_usage(
+        self,
+        api_key: ApiKeyData | None,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        model: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cached_input_tokens: int | None,
+        request_id: str,
+    ) -> bool:
+        """Transfer captured image usage to tracked reservation settlement."""
+        has_usage = input_tokens is not None or output_tokens is not None
+        settlement = _StreamSettlement(
+            status="success" if has_usage else "failed",
+            model=model,
+            input_tokens=int(input_tokens or 0) if has_usage else None,
+            output_tokens=int(output_tokens or 0) if has_usage else None,
+            cached_input_tokens=int(cached_input_tokens or 0) if has_usage else None,
+            service_tier=None,
+        )
+        return await self._settle_stream_api_key_usage(
+            api_key,
+            reservation,
+            settlement,
+            request_id=request_id,
+        )
 
     async def _settle_stream_api_key_usage(
         self,
@@ -416,7 +481,7 @@ class _ApiKeyUsageMixin:
             release_on_failure=not wait_for_settlement,
         )
         if wait_for_settlement:
-            # Ordering-sensitive callers (the websocket error path) must
+            # Ordering-sensitive callers (websocket account-health paths) must
             # commit the settlement before load-balancer health writes; they
             # opt into waiting while everything else stays detached.
             settlement_committed = False
@@ -452,6 +517,7 @@ class _ApiKeyUsageMixin:
                 api_key=api_key,
                 api_key_reservation=api_key_reservation,
                 request_id=request_id,
+                retry_persistence_failures=True,
             )
 
         def _settlement_done(done_task: asyncio.Task[bool]) -> None:
@@ -519,21 +585,48 @@ class _ApiKeyUsageMixin:
         api_key: ApiKeyData,
         api_key_reservation: ApiKeyUsageReservationData,
         request_id: str,
+        retry_persistence_failures: bool = False,
     ) -> bool:
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
-        with anyio.CancelScope(shield=True):
+        retry_attempt = 1
+        retry_delay_seconds = _STREAM_API_KEY_RELEASE_RETRY_BASE_SECONDS
+        while True:
+            retry_slot_acquired = False
             try:
-                async with proxy._repo_factory() as repos:
-                    api_keys_service = _service_api_keys_service()(repos.api_keys)
-                    await api_keys_service.release_usage_reservation(
-                        api_key_reservation.reservation_id,
-                    )
+                if retry_persistence_failures:
+                    await proxy._stream_api_key_release_retry_semaphore.acquire()
+                    retry_slot_acquired = True
+                with anyio.CancelScope(shield=True):
+                    async with proxy._repo_factory() as repos:
+                        api_keys_service = _service_api_keys_service()(repos.api_keys)
+                        await api_keys_service.release_usage_reservation(
+                            api_key_reservation.reservation_id,
+                        )
                 return True
             except Exception:
+                if not retry_persistence_failures:
+                    logger.warning(
+                        "Failed to release stream API key reservation key_id=%s request_id=%s",
+                        api_key.id,
+                        request_id,
+                        exc_info=True,
+                    )
+                    return False
                 logger.warning(
-                    "Failed to release stream API key reservation key_id=%s request_id=%s",
+                    "Failed to release stream API key reservation key_id=%s request_id=%s "
+                    "retry_attempt=%d retry_delay_seconds=%.2f",
                     api_key.id,
                     request_id,
+                    retry_attempt,
+                    retry_delay_seconds,
                     exc_info=True,
                 )
-                return False
+            finally:
+                if retry_slot_acquired:
+                    proxy._stream_api_key_release_retry_semaphore.release()
+            await asyncio.sleep(retry_delay_seconds)
+            retry_attempt += 1
+            retry_delay_seconds = min(
+                _STREAM_API_KEY_RELEASE_RETRY_MAX_SECONDS,
+                retry_delay_seconds * 2,
+            )

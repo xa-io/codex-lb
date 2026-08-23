@@ -13,6 +13,7 @@ from app.db.models import (
     Account,
     AccountStatus,
     AccountUsageRollupState,
+    RequestConversationHourlyRollup,
     RequestLog,
     RequestUsageHourlyRollup,
 )
@@ -31,9 +32,11 @@ from app.modules.accounts.usage_time_rollup import (
     floor_to_hour,
     from_dimension,
     mirror_account_soft_delete_into_time_rollups,
+    run_conversation_fold_pass,
     run_hourly_fold_pass,
     to_dimension,
 )
+from app.modules.reports.repository import ReportsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 
 pytestmark = pytest.mark.integration
@@ -114,6 +117,7 @@ async def test_bootstrap_state_defaults_hourly_watermark_to_epoch(db_setup):
             await session.execute(select(AccountUsageRollupState).where(AccountUsageRollupState.id == 1))
         ).scalar_one()
         assert state.hourly_folded_through == _EPOCH
+        assert state.conversation_folded_through == _EPOCH
 
         repo = RequestUsageTimeRollupRepository(session)
         rows, watermark = await repo.read_hourly()
@@ -377,6 +381,7 @@ async def _add_log(
     service_tier: str | None = None,
     api_key_id: str | None = None,
     model: str = "gpt-5.1-codex",
+    conversation_id: str | None = None,
 ):
     return await logs_repo.add_log(
         account_id=account_id,
@@ -394,6 +399,7 @@ async def _add_log(
         request_kind=request_kind,
         service_tier=service_tier,
         api_key_id=api_key_id,
+        conversation_id=conversation_id,
     )
 
 
@@ -500,6 +506,19 @@ async def test_hourly_fold_folds_dimensions_and_measures(db_setup):
             )
         )
         await session.commit()
+        # hour0, own model bucket: cancelled (client-disconnect) terminals —
+        # counted in request_count and cancelled_count, kept OUT of
+        # error_count and the error satellite (#1552).
+        for index in range(2):
+            await _add_log(
+                logs,
+                account_id="acc_f",
+                request_id=f"r_cancelled_{index}",
+                requested_at=hour0 + timedelta(seconds=400 + index * 30),
+                model="gpt-5.6-cx",
+                status="cancelled",
+                error_code="client_disconnected",
+            )
         # hour1: warmup kind is folded verbatim (reads filter by dimension),
         # plus a cached>input clamp case.
         await _add_log(
@@ -576,6 +595,12 @@ async def test_hourly_fold_folds_dimensions_and_measures(db_setup):
     h0 = by_key[(epoch_seconds(hour0), "acc_f", _S, "gpt-5.1-codex", _S, "normal", False)]
     assert h0.request_count == 2
     assert h0.error_count == 1
+    assert h0.cancelled_count == 0
+
+    cancelled = by_key[(epoch_seconds(hour0), "acc_f", _S, "gpt-5.6-cx", _S, "normal", False)]
+    assert cancelled.request_count == 2
+    assert cancelled.error_count == 0
+    assert cancelled.cancelled_count == 2
     assert h0.input_tokens == 300
     assert h0.output_tokens == 50
     assert h0.reasoning_tokens == 30
@@ -613,6 +638,8 @@ async def test_hourly_fold_folds_dimensions_and_measures(db_setup):
     tail_bucket = epoch_seconds(floor_to_hour(now))
     assert not any(r.bucket_epoch == tail_bucket for r in hourly)
 
+    # The cancelled rows carry error_code=client_disconnected but never
+    # reach the error satellite: they are not errors.
     error_keys = {(r.bucket_epoch, r.account_id, r.error_code): r.error_count for r in errors}
     assert error_keys == {
         (epoch_seconds(hour0), "acc_f", "upstream_500"): 1,
@@ -651,6 +678,11 @@ async def test_hourly_fold_folds_dimensions_and_measures(db_setup):
     assert (epoch_seconds(hour1), "acc_f", _S, "gpt-5.1-codex", _S, "warmup", "success", False) in demand_keys
     assert (epoch_seconds(hour2), "acc_f", "key_1", "gpt-5.1-codex", _S, "normal", "success", False) in demand_keys
     assert (epoch_seconds(hour4), _S, _S, "gpt-5.1-codex", _S, "normal", "error", True) in demand_keys
+    # The demand grain keeps the full status split, so the cancelled rows
+    # land in their own status bin (the dashboard cancelled breakdown reads
+    # this grain across all folded history).
+    cancelled_slot = demand_keys[(epoch_seconds(hour0), "acc_f", _S, "gpt-5.6-cx", _S, "normal", "cancelled", False)]
+    assert cancelled_slot.request_count == 2
 
 
 @pytest.mark.asyncio
@@ -743,6 +775,243 @@ async def test_top_error_empty_code_winner_coerces_to_none(db_setup):
         assert await logs.top_error_between(folded_hour + timedelta(seconds=25), folded_hour + timedelta(hours=1)) == (
             "boom"
         )
+
+
+@pytest.mark.asyncio
+async def test_activity_and_top_error_exclude_cancelled_terminals(db_setup):
+    """Regression for #1552 at the dashboard-overview read paths: cancelled
+    (client-disconnect) rows on BOTH sides of the fold boundary stay in the
+    request total, leave the error numerator and top_error, and surface as
+    the demand-grain-sourced cancelled count. Historical error-satellite rows
+    folded under the legacy `status != 'success'` filter still carry
+    client_disconnected counts — the read must drop that code."""
+    now = utcnow()
+    folded_hour = floor_to_hour(now - timedelta(days=2))
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_cx", "cancelled-ts@example.com"))
+        logs = RequestLogsRepository(session)
+        # Folded side: 1 success, 2 cancelled, 1 genuine error.
+        await _add_log(logs, account_id="acc_cx", request_id="r_cx_ok", requested_at=folded_hour)
+        for index in range(2):
+            await _add_log(
+                logs,
+                account_id="acc_cx",
+                request_id=f"r_cx_folded_{index}",
+                requested_at=folded_hour + timedelta(seconds=30 + index),
+                status="cancelled",
+                error_code="client_disconnected",
+            )
+        await _add_log(
+            logs,
+            account_id="acc_cx",
+            request_id="r_cx_err",
+            requested_at=folded_hour + timedelta(seconds=90),
+            status="error",
+            error_code="upstream_500",
+        )
+        # Raw tail: 1 more cancelled row.
+        await _add_log(
+            logs,
+            account_id="acc_cx",
+            request_id="r_cx_tail",
+            requested_at=now - timedelta(minutes=1),
+            status="cancelled",
+            error_code="client_disconnected",
+        )
+
+    assert await run_hourly_fold_pass(now=now) >= 1
+
+    # Simulate a bucket folded BEFORE this release: the legacy error fold
+    # counted cancelled rows, so old satellite rows carry the code.
+    async with SessionLocal() as session:
+        await RequestUsageTimeRollupRepository(session).add_errors(
+            [
+                HourlyErrorRollupRow(
+                    bucket_epoch=epoch_seconds(folded_hour),
+                    account_id="acc_cx",
+                    error_code="client_disconnected",
+                    error_count=200,
+                )
+            ]
+        )
+        await session.commit()
+
+    since = folded_hour - timedelta(hours=1)
+    async with SessionLocal() as session:
+        logs = RequestLogsRepository(session)
+        activity = await logs.aggregate_activity_between(since, now)
+        assert activity.request_count == 5
+        assert activity.error_count == 1
+        assert activity.cancelled_count == 3
+        assert await logs.top_error_between(since, now) == "upstream_500"
+
+
+@pytest.mark.asyncio
+async def test_first_fold_pass_repairs_legacy_folded_rollout_window(db_setup):
+    """Rolling-upgrade flip-flop defense (#1552): with the persisted
+    `upgrade_repair_from` marker already NULL (new-code bootstrap, or a
+    completed marker repair), a legacy leader that regains fold leadership
+    mid-rollout can still write legacy buckets (cancelled counted in
+    error_count, cancelled_count 0, client_disconnected in the error
+    satellite). Each new-code process's first hourly fold pass must refold
+    the trailing UPGRADE_REPAIR_WINDOW from raw — without touching buckets
+    below the surviving-raw clamp."""
+    now = utcnow()
+    hour = floor_to_hour(now - timedelta(hours=30))
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_rw_fix", "rollout-fix@example.com"))
+        logs = RequestLogsRepository(session)
+        await _add_log(logs, account_id="acc_rw_fix", request_id="r_fix_ok", requested_at=hour)
+        for index in range(2):
+            await _add_log(
+                logs,
+                account_id="acc_rw_fix",
+                request_id=f"r_fix_cx_{index}",
+                requested_at=hour + timedelta(seconds=30 + index),
+                status="cancelled",
+                error_code="client_disconnected",
+            )
+        await _add_log(
+            logs,
+            account_id="acc_rw_fix",
+            request_id="r_fix_err",
+            requested_at=hour + timedelta(seconds=90),
+            status="error",
+            error_code="upstream_500",
+        )
+
+    time_rollup_module._upgrade_repair_done = True  # fold without the repair first
+    assert await run_hourly_fold_pass(now=now) >= 1
+
+    # Simulate the bucket having been folded by a LEGACY replica after the
+    # migration: old error fold, no cancelled split, cancelled disconnects
+    # in the error satellite. Also plant an orphaned rollup bucket BELOW the
+    # earliest surviving raw row (retention-pruned history) inside the
+    # repair span — the raw clamp must leave it untouched.
+    orphan_epoch = epoch_seconds(hour - timedelta(hours=2))
+    async with SessionLocal() as session:
+        await session.execute(
+            update(RequestUsageHourlyRollup)
+            .where(RequestUsageHourlyRollup.bucket_epoch == epoch_seconds(hour))
+            .values(error_count=3, cancelled_count=0)
+        )
+        repo = RequestUsageTimeRollupRepository(session)
+        await repo.add_errors(
+            [
+                HourlyErrorRollupRow(
+                    bucket_epoch=epoch_seconds(hour),
+                    account_id="acc_rw_fix",
+                    error_code="client_disconnected",
+                    error_count=2,
+                )
+            ]
+        )
+        await repo.add_hourly([_hourly_row(orphan_epoch, account_id="acc_rw_fix", request_count=5, error_count=5)])
+        await session.commit()
+
+    # New code's first pass (one-shot flag re-armed) repairs the window even
+    # though the watermark is already at target (no forward slice to fold).
+    time_rollup_module._upgrade_repair_done = False
+    await run_hourly_fold_pass(now=now)
+    time_rollup_module._upgrade_repair_done = True
+
+    hourly, errors, _demand, _watermark = await _dump_all_rollups()
+    repaired = next(r for r in hourly if r.bucket_epoch == epoch_seconds(hour))
+    assert repaired.request_count == 4
+    assert repaired.error_count == 1
+    assert repaired.cancelled_count == 2
+    error_keys = {(r.bucket_epoch, r.error_code): r.error_count for r in errors}
+    assert error_keys == {(epoch_seconds(hour), "upstream_500"): 1}
+    orphan = next(r for r in hourly if r.bucket_epoch == orphan_epoch)
+    assert orphan.request_count == 5
+    assert orphan.error_count == 5
+
+
+@pytest.mark.asyncio
+async def test_upgrade_repair_marker_covers_multi_slice_legacy_advance(db_setup):
+    """Rolling-upgrade fence, marker path (#1552): a legacy leader can
+    advance up to TS_MAX_SLICES_PER_PASS x TS_FOLD_SLICE in one pass, so no
+    fixed trailing window covers its damage. The persisted
+    `upgrade_repair_from` marker (stamped by the migration, epoch-defaulted
+    for old-code bootstraps) makes new code refold the exact suspect range
+    `[marker, watermark)` in chunks — persisting progress through the
+    marker — and clear it to NULL when done."""
+    now = utcnow()
+    # Two legacy-corrupted buckets more than one TS_FOLD_SLICE (48h) apart:
+    # the far one is unreachable by the trailing flip-flop window alone.
+    hour_far = floor_to_hour(now - timedelta(hours=70))
+    hour_near = floor_to_hour(now - timedelta(hours=30))
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_mk", "marker-fix@example.com"))
+        logs = RequestLogsRepository(session)
+        for label, hour in (("far", hour_far), ("near", hour_near)):
+            await _add_log(logs, account_id="acc_mk", request_id=f"r_mk_{label}_ok", requested_at=hour)
+            for index in range(2):
+                await _add_log(
+                    logs,
+                    account_id="acc_mk",
+                    request_id=f"r_mk_{label}_cx_{index}",
+                    requested_at=hour + timedelta(seconds=30 + index),
+                    status="cancelled",
+                    error_code="client_disconnected",
+                )
+            await _add_log(
+                logs,
+                account_id="acc_mk",
+                request_id=f"r_mk_{label}_err",
+                requested_at=hour + timedelta(seconds=90),
+                status="error",
+                error_code="upstream_500",
+            )
+
+    time_rollup_module._upgrade_repair_done = True  # fold without the repair first
+    assert await run_hourly_fold_pass(now=now) >= 1
+
+    # Rewrite BOTH buckets to the legacy fold and arm the marker as the
+    # migration would have (stamped at the pre-rollout watermark, before a
+    # legacy leader advanced ~70h of slices past it).
+    marker = floor_to_hour(now - timedelta(hours=72))
+    async with SessionLocal() as session:
+        for hour in (hour_far, hour_near):
+            await session.execute(
+                update(RequestUsageHourlyRollup)
+                .where(RequestUsageHourlyRollup.bucket_epoch == epoch_seconds(hour))
+                .values(error_count=3, cancelled_count=0)
+            )
+        await RequestUsageTimeRollupRepository(session).add_errors(
+            [
+                HourlyErrorRollupRow(
+                    bucket_epoch=epoch_seconds(hour),
+                    account_id="acc_mk",
+                    error_code="client_disconnected",
+                    error_count=2,
+                )
+                for hour in (hour_far, hour_near)
+            ]
+        )
+        await session.execute(update(AccountUsageRollupState).values(upgrade_repair_from=marker))
+        await session.commit()
+
+    time_rollup_module._upgrade_repair_done = False
+    await run_hourly_fold_pass(now=now)
+    time_rollup_module._upgrade_repair_done = True
+
+    hourly, errors, _demand, _watermark = await _dump_all_rollups()
+    for hour in (hour_far, hour_near):
+        repaired = next(r for r in hourly if r.bucket_epoch == epoch_seconds(hour))
+        assert repaired.request_count == 4
+        assert repaired.error_count == 1
+        assert repaired.cancelled_count == 2
+    error_keys = {(r.bucket_epoch, r.error_code): r.error_count for r in errors}
+    assert error_keys == {
+        (epoch_seconds(hour_far), "upstream_500"): 1,
+        (epoch_seconds(hour_near), "upstream_500"): 1,
+    }
+    async with SessionLocal() as session:
+        state = (
+            await session.execute(select(AccountUsageRollupState).where(AccountUsageRollupState.id == 1))
+        ).scalar_one()
+        assert state.upgrade_repair_from is None
 
 
 @pytest.mark.asyncio
@@ -1159,3 +1428,213 @@ async def test_rewound_watermark_refold_converges(db_setup):
 
     assert await run_hourly_fold_pass(now=now) >= 1
     assert await _dump_all_rollups() == baseline
+
+
+# --- Conversation presence satellite ---------------------------------------
+
+
+async def _dump_conversation_rollups() -> list[tuple[int, str, str, bool, int]]:
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(RequestConversationHourlyRollup))).scalars().all()
+        return sorted(
+            (row.bucket_epoch, row.conversation_id, row.account_id, row.is_deleted, row.request_count) for row in rows
+        )
+
+
+async def _conversation_activity(since: datetime, until: datetime) -> tuple[int, int]:
+    async with SessionLocal() as session:
+        activity = await RequestLogsRepository(session).aggregate_activity_between(since, until)
+        return activity.conversation_count, activity.conversation_request_count
+
+
+@pytest.mark.asyncio
+async def test_conversation_fold_dedups_across_the_fold_boundary(db_setup):
+    """A conversation with rows on both sides of the conversation watermark
+    counts ONCE: the folded id and the raw-tail id merge through the UNION
+    before COUNT(DISTINCT), while the request total stays additive. Warmup
+    kinds and blank ids never enter the satellite."""
+    now = utcnow()
+    mid = floor_to_hour(now - timedelta(days=2))
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_conv", "conv-ts@example.com"))
+        logs = RequestLogsRepository(session)
+        await _add_log(
+            logs,
+            account_id="acc_conv",
+            request_id="r_cv_folded",
+            requested_at=mid - timedelta(days=1),
+            conversation_id="conv_x",
+        )
+        await _add_log(
+            logs,
+            account_id="acc_conv",
+            request_id="r_cv_tail",
+            requested_at=mid + timedelta(hours=1),
+            conversation_id="conv_x",
+        )
+        await _add_log(
+            logs,
+            account_id="acc_conv",
+            request_id="r_cv_warm",
+            requested_at=mid - timedelta(days=1, hours=1),
+            request_kind="warmup",
+            conversation_id="conv_x",
+        )
+        await _add_log(
+            logs,
+            account_id="acc_conv",
+            request_id="r_cv_blank",
+            requested_at=mid - timedelta(days=1, hours=2),
+            conversation_id=" \t",
+        )
+
+    window = (mid - timedelta(days=2), now)
+    reference = await _conversation_activity(*window)
+    assert reference == (1, 2)
+
+    # Watermark lands exactly at `mid`: the first row folds, the second stays
+    # in the live tail, and the metrics must not change.
+    assert await run_conversation_fold_pass(now=mid + FOLD_LAG) >= 1
+    async with SessionLocal() as session:
+        state = (
+            await session.execute(select(AccountUsageRollupState).where(AccountUsageRollupState.id == 1))
+        ).scalar_one()
+        assert state.conversation_folded_through == mid
+    folded = await _dump_conversation_rollups()
+    assert [(row[1], row[2], row[3], row[4]) for row in folded] == [("conv_x", "acc_conv", False, 1)]
+    assert await _conversation_activity(*window) == reference
+
+    # Idempotent fixed point at the same clock.
+    assert await run_conversation_fold_pass(now=mid + FOLD_LAG) == 0
+    assert await _dump_conversation_rollups() == folded
+
+
+@pytest.mark.asyncio
+async def test_conversation_bucket_series_rollup_matches_and_degrades(db_setup):
+    """Hour-multiple display buckets are served rollup+tail and must equal
+    the pre-fold (pure raw) series; non-hour-multiple buckets take the
+    documented full-raw degrade path and must also be unchanged."""
+    now = utcnow()
+    hour = floor_to_hour(now - timedelta(days=2))
+    since = hour - timedelta(days=1)
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_cser", "cser-ts@example.com"))
+        logs = RequestLogsRepository(session)
+        for index, (offset, conversation_id) in enumerate(
+            [
+                (timedelta(minutes=1), "conv_a"),
+                (timedelta(minutes=2), "conv_a"),
+                (timedelta(hours=1, minutes=1), "conv_a"),
+                (timedelta(hours=1, minutes=2), "conv_b"),
+            ]
+        ):
+            await _add_log(
+                logs,
+                account_id="acc_cser",
+                request_id=f"r_cs_{index}",
+                requested_at=hour + offset,
+                conversation_id=conversation_id,
+            )
+
+    async def _series(bucket_seconds: int):
+        async with SessionLocal() as session:
+            rows = await RequestLogsRepository(session).aggregate_conversations_by_bucket(since, bucket_seconds)
+            return [(row.bucket_epoch, row.conversation_count) for row in rows]
+
+    hour_epoch = epoch_seconds(hour)
+    before_hourly, before_odd = await _series(3600), await _series(5400)
+    assert before_hourly == [(hour_epoch, 1), (hour_epoch + 3600, 2)]
+
+    await run_conversation_fold_pass(now=now)
+    assert await _series(3600) == before_hourly
+    assert await _series(5400) == before_odd
+
+
+@pytest.mark.asyncio
+async def test_account_soft_delete_mirrors_conversation_presence(db_setup):
+    """Soft deletion retroactively detaches the account's raw history
+    (account_id=NULL, deleted_at=now); the folded presence must move to the
+    orphaned-deleted dimension so the dashboard reads (deleted_at IS NULL)
+    stop counting it while the reports reads (no deleted_at filter) keep it —
+    exactly what the raw scan reports after the UPDATE."""
+    now = utcnow()
+    hour = floor_to_hour(now - timedelta(days=2))
+    window = (hour - timedelta(hours=1), now)
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_csoft", "csoft-ts@example.com"))
+        await AccountsRepository(session).upsert(_make_account("acc_ckeep", "ckeep-ts@example.com"))
+        logs = RequestLogsRepository(session)
+        for index in range(2):
+            await _add_log(
+                logs,
+                account_id="acc_csoft",
+                request_id=f"r_cd_{index}",
+                requested_at=hour + timedelta(minutes=index),
+                conversation_id="conv_del",
+            )
+        await _add_log(
+            logs,
+            account_id="acc_ckeep",
+            request_id="r_ck",
+            requested_at=hour + timedelta(minutes=5),
+            conversation_id="conv_keep",
+        )
+    await run_conversation_fold_pass(now=now)
+
+    async with SessionLocal() as session:
+        assert await AccountsRepository(session).delete("acc_csoft")
+
+    assert await _conversation_activity(*window) == (1, 1)  # conv_keep only
+    async with SessionLocal() as session:
+        summary = await ReportsRepository(session).aggregate_summary(*window)
+    assert summary.conversation_count == 2  # reports include soft-deleted rows
+    assert await _dump_conversation_rollups() == [
+        (epoch_seconds(hour), "conv_del", _S, True, 2),
+        (epoch_seconds(hour), "conv_keep", "acc_ckeep", False, 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_account_hard_delete_removes_conversation_presence(db_setup):
+    """History deletion physically removes the account's raw rows; the mirror
+    must remove exactly that account's folded presence — a conversation
+    shared with a surviving account keeps the survivor's contribution, so
+    the switched reads still equal a raw scan of what remains."""
+    now = utcnow()
+    hour = floor_to_hour(now - timedelta(days=2))
+    window = (hour - timedelta(hours=1), now)
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("acc_chard", "chard-ts@example.com"))
+        await AccountsRepository(session).upsert(_make_account("acc_cother", "cother-ts@example.com"))
+        logs = RequestLogsRepository(session)
+        await _add_log(
+            logs,
+            account_id="acc_chard",
+            request_id="r_ch_shared",
+            requested_at=hour + timedelta(minutes=1),
+            conversation_id="conv_shared",
+        )
+        await _add_log(
+            logs,
+            account_id="acc_cother",
+            request_id="r_co_shared",
+            requested_at=hour + timedelta(minutes=2),
+            conversation_id="conv_shared",
+        )
+        await _add_log(
+            logs,
+            account_id="acc_chard",
+            request_id="r_ch_only",
+            requested_at=hour + timedelta(minutes=3),
+            conversation_id="conv_only",
+        )
+    await run_conversation_fold_pass(now=now)
+    assert await _conversation_activity(*window) == (2, 3)
+
+    async with SessionLocal() as session:
+        assert await AccountsRepository(session).delete("acc_chard", delete_history=True)
+
+    assert await _conversation_activity(*window) == (1, 1)  # conv_shared via the survivor
+    assert await _dump_conversation_rollups() == [
+        (epoch_seconds(hour), "conv_shared", "acc_cother", False, 1),
+    ]

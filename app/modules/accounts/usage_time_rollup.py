@@ -1,6 +1,6 @@
 """Time-axis request-usage rollups: schema primitives and repository.
 
-Three permanent aggregate tables serve the dashboard/statistics read paths
+Four permanent aggregate tables serve the dashboard/statistics read paths
 without scanning raw ``request_logs``:
 
 - ``request_usage_hourly_rollups`` — UTC hour buckets x (account_id,
@@ -12,12 +12,21 @@ without scanning raw ``request_logs``:
   planner. The full legacy demand grain is preserved on purpose: the
   planner's ``_bin_demand_units`` applies ``max()`` PER BIN before summing
   (nonlinear), so folding to a coarser grain would change forecasts.
+- ``request_conversation_hourly_rollups`` — UTC hour buckets x (normalized
+  conversation_id, account_id, is_deleted); the distinct-conversation
+  presence satellite. Folded on its OWN watermark and fold pass with the
+  shared read-side filter (normalized conversation id present, warmup kinds
+  excluded); the deleted split stays a dimension because the dashboard
+  conversation reads exclude soft-deleted rows while the reports reads
+  include them.
 
-Watermark contract: ``account_usage_rollup_state.hourly_folded_through`` (the
-same single state row as the lifetime fold, so one ``FOR UPDATE`` row lock
-serializes every fold and lifecycle mutation) is ALWAYS aligned to a whole
-UTC hour. Raw rows with ``requested_at < watermark`` are fully folded; rows
-at or above it are the live tail. Buckets are half-open ``[start, end)``.
+Watermark contract: ``account_usage_rollup_state.hourly_folded_through`` and
+``conversation_folded_through`` (the same single state row as the lifetime
+fold, so one ``FOR UPDATE`` row lock serializes every fold and lifecycle
+mutation) are ALWAYS aligned to a whole UTC hour. Raw rows with
+``requested_at < watermark`` are fully folded by that watermark's tables;
+rows at or above it are the live tail. Buckets are half-open ``[start,
+end)``.
 
 NULL-dimension sentinel: nullable raw dimensions (account_id, api_key_id,
 service_tier, reasoning_effort) are stored as ``'\\x1f'`` so they can
@@ -34,12 +43,14 @@ rollups from raw.
 History-rewrite discipline (MUST): any code path that mutates a folded
 dimension (``requested_at``, ``deleted_at``, ``account_id``, ``api_key_id``,
 ``model``, ``service_tier``, ``reasoning_effort``, ``request_kind``,
-``status``, ``error_code``) or an aggregated measure column of
-``request_logs`` rows BELOW the hourly watermark must take
+``status``, ``error_code``, ``conversation_id``) or an aggregated measure
+column of ``request_logs`` rows BELOW the relevant watermark must take
 ``lock_fold_state()`` in the same transaction and either mirror the mutation
-into all three rollup tables or skip the pre-watermark rows (folded buckets
-are never recomputed from raw — raw may already be pruned by retention).
-``RequestLogsRepository.update_model_for_request`` takes the skip route.
+into every rollup table that folded it or skip the pre-watermark rows
+(folded buckets are never recomputed from raw — raw may already be pruned by
+retention). ``RequestLogsRepository.update_model_for_request`` takes the
+skip route (and needs no conversation-satellite bound at all: neither
+``model`` nor ``cost_usd`` is folded there).
 """
 
 from __future__ import annotations
@@ -52,9 +63,11 @@ from datetime import datetime, timedelta
 from sqlalchemy import BigInteger, ColumnElement, Integer, and_, case, cast, delete, func, insert, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.usage.logs import CANCELLED_STATUS, NON_ERROR_STATUSES
 from app.core.utils.time import utcnow
 from app.db.models import (
     AccountUsageRollupState,
+    RequestConversationHourlyRollup,
     RequestDemandQuarterRollup,
     RequestLog,
     RequestUsageHourlyErrorRollup,
@@ -82,6 +95,39 @@ QUARTER_SLOT_SECONDS = 900
 TS_FOLD_SLICE = timedelta(hours=48)
 TS_MAX_SLICES_PER_PASS = 20
 
+# Rolling-upgrade repair (#1552): the cancelled_count migration runs before
+# old replicas drain, so a legacy leader can still fold hours with the old
+# error fold (cancelled terminals counted as errors, cancelled_count 0,
+# client_disconnected folded into the error satellite) and advance the shared
+# watermark — buckets new code would otherwise never revisit. Old writers run
+# old code and cannot be fenced, so the NEW code repairs instead: it refolds
+# the legacy-suspect range `[upgrade_repair_from, hourly_folded_through)`
+# from raw. The marker is stamped by the migration (existing rows get their
+# then-current watermark; a state row bootstrapped by an OLD replica after
+# the migration gets the epoch server default, marking its entire backfill
+# suspect — a legacy leader can advance TS_MAX_SLICES_PER_PASS x
+# TS_FOLD_SLICE per pass, so no fixed trailing window could cover it) and
+# cleared to NULL only by new code once the range is refolded. Repair
+# progress persists chunk-by-chunk through the marker, so a crash resumes
+# instead of restarting.
+#
+# With the marker already NULL, each process's first fold pass still refolds
+# this trailing window as flip-flop defense: an old replica that regains
+# fold leadership AFTER the marker was cleared (mid-rollout) writes legacy
+# buckets the marker no longer tracks. A steady-state legacy interlude
+# advances the watermark by minutes-to-hours — far below this span — and the
+# rollout that makes interludes possible also guarantees another new-code
+# process (the old replica's replacement) starts afterwards and runs this
+# defense. Cost: one backfill-slice-equivalent per process start.
+#
+# Both paths clamp to hours fully covered by surviving raw rows (retention
+# prunes oldest-first with a contiguous frontier, so every row at or above
+# the earliest surviving one is intact) — the repair can never erase folded
+# statistics it cannot recompute; clamped-out buckets keep the disclosed
+# legacy fold. Neither path is a historical backfill.
+UPGRADE_REPAIR_WINDOW = timedelta(hours=48)
+_upgrade_repair_done = False
+
 _EPOCH = datetime(1970, 1, 1)
 
 # Synthetic request kinds every statistics read path filters out. Folded
@@ -89,6 +135,22 @@ _EPOCH = datetime(1970, 1, 1)
 # legacy raw queries do row-side.
 WARMUP_REQUEST_KINDS = ("warmup", "limit_warmup")
 _EXCLUDED_REQUEST_KINDS = WARMUP_REQUEST_KINDS
+
+# The whitespace set the conversation readers strip before comparing/counting
+# conversation ids (str.strip()'s ASCII whitespace).
+CONVERSATION_WHITESPACE = " \t\n\v\f\r"
+
+
+def conversation_id_expr() -> ColumnElement:
+    """Normalized conversation id: trimmed, with blank collapsed to NULL.
+
+    The single SQL definition shared by the conversation fold and every
+    conversation reader (dashboard and reports repositories) — a drifted
+    variant would silently split one conversation into two.
+    """
+    trimmed = func.ltrim(func.rtrim(RequestLog.conversation_id, CONVERSATION_WHITESPACE), CONVERSATION_WHITESPACE)
+    return func.nullif(trimmed, "")
+
 
 # Stored stand-in for NULL account_id / api_key_id / service_tier /
 # reasoning_effort (PK columns cannot be NULL, and NULLs would be distinct
@@ -138,6 +200,7 @@ class HourlyUsageRollupRow:
     is_deleted: bool
     request_count: int = 0
     error_count: int = 0
+    cancelled_count: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int = 0
@@ -173,6 +236,15 @@ class QuarterDemandRollupRow:
     cost_usd: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class ConversationHourlyRollupRow:
+    bucket_epoch: int
+    conversation_id: str
+    account_id: str
+    is_deleted: bool
+    request_count: int = 0
+
+
 _HOURLY_KEY_COLUMNS = (
     "bucket_epoch",
     "account_id",
@@ -185,6 +257,7 @@ _HOURLY_KEY_COLUMNS = (
 _HOURLY_MEASURE_COLUMNS = (
     "request_count",
     "error_count",
+    "cancelled_count",
     "input_tokens",
     "output_tokens",
     "reasoning_tokens",
@@ -213,6 +286,8 @@ _QUARTER_MEASURE_COLUMNS = (
     "cached_input_tokens",
     "cost_usd",
 )
+_CONVERSATION_KEY_COLUMNS = ("bucket_epoch", "conversation_id", "account_id", "is_deleted")
+_CONVERSATION_MEASURE_COLUMNS = ("request_count",)
 
 
 def _merge_rows(rows: Iterable, key_width: int, columns: tuple[str, ...], row_type):
@@ -232,8 +307,8 @@ def _merge_rows(rows: Iterable, key_width: int, columns: tuple[str, ...], row_ty
 
 
 # Rows per multi-VALUES upsert statement. asyncpg rejects statements with
-# more than 32,767 bind parameters; at 17 columns (the widest table) 1,000
-# rows binds 17,000 — comfortable margin on both dialects. Lifecycle mirrors
+# more than 32,767 bind parameters; at 18 columns (the widest table) 1,000
+# rows binds 18,000 — comfortable margin on both dialects. Lifecycle mirrors
 # rekey an account's ENTIRE folded history in one call (thousands of rows
 # for a long-lived account), so unchunked upserts would abort the whole
 # lifecycle transaction.
@@ -306,6 +381,16 @@ class RequestUsageTimeRollupRepository:
             _QUARTER_KEY_COLUMNS,
             _QUARTER_KEY_COLUMNS + _QUARTER_MEASURE_COLUMNS,
             QuarterDemandRollupRow,
+        )
+
+    async def add_conversations(self, rows: Sequence[ConversationHourlyRollupRow]) -> None:
+        await _merge_add(
+            self._session,
+            RequestConversationHourlyRollup,
+            rows,
+            _CONVERSATION_KEY_COLUMNS,
+            _CONVERSATION_KEY_COLUMNS + _CONVERSATION_MEASURE_COLUMNS,
+            ConversationHourlyRollupRow,
         )
 
     async def read_hourly(
@@ -437,7 +522,8 @@ def _hourly_fold_insert(session: AsyncSession, window: tuple[ColumnElement, ...]
             RequestLog.request_kind,
             is_deleted,
             func.count(RequestLog.id),
-            func.coalesce(func.sum(case((RequestLog.status != "success", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((RequestLog.status.not_in(NON_ERROR_STATUSES), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((RequestLog.status == CANCELLED_STATUS, 1), else_=0)), 0),
             func.coalesce(func.sum(RequestLog.input_tokens), 0),
             func.coalesce(func.sum(RequestLog.output_tokens), 0),
             func.coalesce(func.sum(RequestLog.reasoning_tokens), 0),
@@ -456,14 +542,16 @@ def _hourly_fold_insert(session: AsyncSession, window: tuple[ColumnElement, ...]
 def _error_fold_insert(session: AsyncSession, window: tuple[ColumnElement, ...]):
     bucket = _requested_at_epoch_bucket_expr(session, HOURLY_BUCKET_SECONDS).label("bucket_epoch")
     account_id = _dimension_expr(RequestLog.account_id).label("account_id")
-    # Exact reproduction of the top-error read filter:
-    # warmup kinds excluded, soft-deleted rows INCLUDED.
+    # Exact reproduction of the top-error read filter: warmup kinds excluded,
+    # soft-deleted rows INCLUDED, cancelled terminals excluded (they are not
+    # errors; buckets folded before that exclusion still carry
+    # client_disconnected counts, which the reads drop by error_code).
     stmt = (
         select(bucket, account_id, RequestLog.error_code, func.count(RequestLog.id))
         .where(
             *window,
             RequestLog.request_kind.not_in(_EXCLUDED_REQUEST_KINDS),
-            RequestLog.status != "success",
+            RequestLog.status.not_in(NON_ERROR_STATUSES),
             RequestLog.error_code.is_not(None),
         )
         .group_by(bucket, account_id, RequestLog.error_code)
@@ -514,6 +602,34 @@ def _demand_fold_insert(session: AsyncSession, window: tuple[ColumnElement, ...]
     return insert(RequestDemandQuarterRollup).from_select(list(_QUARTER_KEY_COLUMNS + _QUARTER_MEASURE_COLUMNS), stmt)
 
 
+# Shared fold filter of the conversation satellite: exactly the row set every
+# conversation reader counts. The dashboard readers additionally require
+# `deleted_at IS NULL` and the reports readers additionally exclude
+# `source = 'limit_warmup'`; the former is the `is_deleted` dimension, the
+# latter is subsumed by the request_kind filter for every row the system
+# writes (limit-warmup traffic always carries a warmup request_kind).
+def _conversation_fold_conditions() -> tuple[ColumnElement[bool], ...]:
+    return (
+        conversation_id_expr().is_not(None),
+        RequestLog.request_kind.not_in(_EXCLUDED_REQUEST_KINDS),
+    )
+
+
+def _conversation_fold_insert(session: AsyncSession, window: tuple[ColumnElement, ...]):
+    bucket = _requested_at_epoch_bucket_expr(session, HOURLY_BUCKET_SECONDS).label("bucket_epoch")
+    conversation_id = conversation_id_expr().label("conversation_id")
+    account_id = _dimension_expr(RequestLog.account_id).label("account_id")
+    is_deleted = RequestLog.deleted_at.is_not(None).label("is_deleted")
+    stmt = (
+        select(bucket, conversation_id, account_id, is_deleted, func.count(RequestLog.id))
+        .where(*window, *_conversation_fold_conditions())
+        .group_by(bucket, conversation_id, account_id, is_deleted)
+    )
+    return insert(RequestConversationHourlyRollup).from_select(
+        list(_CONVERSATION_KEY_COLUMNS + _CONVERSATION_MEASURE_COLUMNS), stmt
+    )
+
+
 async def run_hourly_fold_pass(*, now: datetime | None = None) -> int:
     """Advance the hourly watermark toward `floor_hour(now - FOLD_LAG)`.
 
@@ -525,7 +641,17 @@ async def run_hourly_fold_pass(*, now: datetime | None = None) -> int:
     rolls the whole slice back and the retry recomputes it from scratch —
     re-folding always converges to the same values (no add-fold double
     counting is possible).
+
+    The first pass of each process additionally repairs the legacy-suspect
+    range `[upgrade_repair_from, watermark)` — buckets a legacy replica may
+    have folded after the cancelled_count migration during a rolling
+    upgrade — falling back to the trailing `UPGRADE_REPAIR_WINDOW` as
+    flip-flop defense once the marker is cleared (see the constant's note).
+    An incomplete (pass-bounded) repair re-arms itself for the next pass.
     """
+    global _upgrade_repair_done
+    if not _upgrade_repair_done:
+        _upgrade_repair_done = await _run_upgrade_repair()
     target = floor_to_hour((now or utcnow()) - FOLD_LAG)
     committed = 0
     while committed < TS_MAX_SLICES_PER_PASS:
@@ -536,6 +662,107 @@ async def run_hourly_fold_pass(*, now: datetime | None = None) -> int:
         if status is _FoldStatus.DONE:
             break
     return committed
+
+
+def _ceil_to_hour(value: datetime) -> datetime:
+    floored = floor_to_hour(value)
+    return floored if floored == value else floored + timedelta(hours=1)
+
+
+async def _run_upgrade_repair() -> bool:
+    """Drive the upgrade repair in pass-bounded chunks; True when complete.
+
+    Same chunk/transaction discipline as the fold backfill: at most
+    `TS_MAX_SLICES_PER_PASS` chunks of `TS_FOLD_SLICE` per pass, each in its
+    own transaction, so repairing a legacy-folded backlog never monopolizes
+    a scheduler tick. An incomplete repair returns False and resumes from
+    the persisted marker on the next pass.
+    """
+    for _ in range(TS_MAX_SLICES_PER_PASS):
+        async with get_background_session() as session:
+            if await _repair_next_upgrade_chunk(session):
+                return True
+    return False
+
+
+async def _repair_next_upgrade_chunk(session: AsyncSession) -> bool:
+    """Refold the next chunk of the legacy-suspect range; True when none left.
+
+    The suspect range is `[upgrade_repair_from, watermark)` while the marker
+    is set (stamped by the migration, or the epoch server default for a
+    state row an old replica bootstrapped after it), and the trailing
+    `UPGRADE_REPAIR_WINDOW` flip-flop defense once it is NULL. Both are
+    clamped to `ceil_hour(earliest surviving raw row)` — an unfiltered min:
+    retention's oldest-first contiguous frontier guarantees every row
+    (soft-deleted included) at or above it survives, so the repair never
+    deletes folded statistics it cannot recompute from raw.
+
+    Runs under the fold-state row lock (the caller already holds the leader
+    gate), so it can never interleave with a fold slice or lifecycle mirror,
+    and never moves the watermark. The same DELETE-then-INSERT statements as
+    the fold make every chunk converge on any input state — repairing a
+    legacy-folded bucket, re-running after a crash (the marker advances only
+    with the chunk's commit), or recomputing an already-correct window are
+    the same recomputation. The conversation satellite is untouched: its
+    fold never involved status.
+    """
+    async with sqlite_writer_section():
+        state = await _locked_state(session)
+        if state is None:
+            # Nothing folded yet, so nothing a legacy writer could have left.
+            return True
+        watermark = state.hourly_folded_through
+        marker = state.upgrade_repair_from
+        suspect_from = marker if marker is not None else watermark - UPGRADE_REPAIR_WINDOW
+        earliest_raw = (await session.execute(select(func.min(RequestLog.requested_at)))).scalar_one_or_none()
+        start = watermark if earliest_raw is None else max(suspect_from, _ceil_to_hour(earliest_raw))
+        if start >= watermark:
+            if marker is not None:
+                await _set_upgrade_repair_marker(session, None)
+                await session.commit()
+            return True
+        chunk_end = min(start + TS_FOLD_SLICE, watermark)
+        start_epoch, end_epoch = epoch_seconds(start), epoch_seconds(chunk_end)
+        await session.execute(
+            delete(RequestUsageHourlyRollup).where(
+                RequestUsageHourlyRollup.bucket_epoch >= start_epoch,
+                RequestUsageHourlyRollup.bucket_epoch < end_epoch,
+            )
+        )
+        await session.execute(
+            delete(RequestUsageHourlyErrorRollup).where(
+                RequestUsageHourlyErrorRollup.bucket_epoch >= start_epoch,
+                RequestUsageHourlyErrorRollup.bucket_epoch < end_epoch,
+            )
+        )
+        await session.execute(
+            delete(RequestDemandQuarterRollup).where(
+                RequestDemandQuarterRollup.slot_epoch >= start_epoch,
+                RequestDemandQuarterRollup.slot_epoch < end_epoch,
+            )
+        )
+        window = (RequestLog.requested_at >= start, RequestLog.requested_at < chunk_end)
+        await session.execute(_hourly_fold_insert(session, window))
+        await session.execute(_error_fold_insert(session, window))
+        await session.execute(_demand_fold_insert(session, window))
+        done = chunk_end >= watermark
+        if marker is not None:
+            await _set_upgrade_repair_marker(session, None if done else chunk_end)
+        await session.commit()
+        logger.info(
+            "Refolded hourly usage rollups in [%s, %s) (post-upgrade repair)",
+            start.isoformat(),
+            chunk_end.isoformat(),
+        )
+        return done
+
+
+async def _set_upgrade_repair_marker(session: AsyncSession, value: datetime | None) -> None:
+    await session.execute(
+        update(AccountUsageRollupState)
+        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
+        .values(upgrade_repair_from=value)
+    )
 
 
 async def _fold_next_hourly_slice(session: AsyncSession, target: datetime) -> tuple[_FoldStatus, bool]:
@@ -636,6 +863,88 @@ async def _advance_hourly_watermark(session: AsyncSession, value: datetime) -> N
     )
 
 
+async def run_conversation_fold_pass(*, now: datetime | None = None) -> int:
+    """Advance the conversation watermark toward `floor_hour(now - FOLD_LAG)`.
+
+    Same slice/transaction/crash-safety contract as `run_hourly_fold_pass`
+    (DELETE-then-INSERT slices, bounded per pass, watermark advance committed
+    atomically with the slice), on the satellite's own watermark so its
+    from-epoch backfill neither rewinds nor stalls the other rollups.
+    """
+    target = floor_to_hour((now or utcnow()) - FOLD_LAG)
+    committed = 0
+    while committed < TS_MAX_SLICES_PER_PASS:
+        async with get_background_session() as session:
+            status, wrote = await _fold_next_conversation_slice(session, target)
+        if wrote:
+            committed += 1
+        if status is _FoldStatus.DONE:
+            break
+    return committed
+
+
+async def _fold_next_conversation_slice(session: AsyncSession, target: datetime) -> tuple[_FoldStatus, bool]:
+    async with sqlite_writer_section():
+        # Same state row lock as every other fold and lifecycle mirror.
+        state = await _locked_state(session)
+        if state is None:
+            await session.execute(_state_bootstrap_stmt(session))
+            await session.commit()
+            state = await _locked_state(session)
+        if state is None:
+            logger.warning("account_usage_rollup_state row missing; skipping conversation fold pass")
+            return _FoldStatus.DONE, False
+        watermark = state.conversation_folded_through
+        if watermark >= target:
+            return _FoldStatus.DONE, False
+
+        # Unlike the hourly fold (which folds every row), only rows matching
+        # the fold filter contribute here, so the empty-prefix/gap jump scans
+        # for the next COUNTABLE row — hours holding only conversation-less
+        # rows are skipped exactly like empty ones.
+        next_populated = (
+            await session.execute(
+                select(func.min(RequestLog.requested_at)).where(
+                    RequestLog.requested_at >= watermark,
+                    RequestLog.requested_at < target,
+                    *_conversation_fold_conditions(),
+                )
+            )
+        ).scalar_one_or_none()
+        if next_populated is None:
+            await _advance_conversation_watermark(session, target)
+            await session.commit()
+            logger.info("Folded conversation rollups through %s (no rows below target)", target.isoformat())
+            return _FoldStatus.DONE, True
+
+        start = max(watermark, floor_to_hour(next_populated))
+        slice_end = min(start + TS_FOLD_SLICE, target)
+        start_epoch, end_epoch = epoch_seconds(start), epoch_seconds(slice_end)
+
+        # Defensive DELETE with the same convergence/preservation trade-off
+        # as the hourly slice: skipped hours are deliberately NOT cleared.
+        await session.execute(
+            delete(RequestConversationHourlyRollup).where(
+                RequestConversationHourlyRollup.bucket_epoch >= start_epoch,
+                RequestConversationHourlyRollup.bucket_epoch < end_epoch,
+            )
+        )
+        window = (RequestLog.requested_at >= start, RequestLog.requested_at < slice_end)
+        await session.execute(_conversation_fold_insert(session, window))
+        await _advance_conversation_watermark(session, slice_end)
+        await session.commit()
+        logger.info("Folded conversation rollups through %s", slice_end.isoformat())
+        return (_FoldStatus.DONE if slice_end >= target else _FoldStatus.CONTINUE), True
+
+
+async def _advance_conversation_watermark(session: AsyncSession, value: datetime) -> None:
+    await session.execute(
+        update(AccountUsageRollupState)
+        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
+        .values(conversation_folded_through=value)
+    )
+
+
 # --- Account lifecycle mirrors -------------------------------------------
 #
 # The ONLY code paths allowed to touch folded buckets after the watermark
@@ -648,6 +957,12 @@ _ROLLUP_TABLES = (
     (RequestUsageHourlyRollup, _HOURLY_KEY_COLUMNS + _HOURLY_MEASURE_COLUMNS, HourlyUsageRollupRow, "add_hourly"),
     (RequestUsageHourlyErrorRollup, _ERROR_KEY_COLUMNS + _ERROR_MEASURE_COLUMNS, HourlyErrorRollupRow, "add_errors"),
     (RequestDemandQuarterRollup, _QUARTER_KEY_COLUMNS + _QUARTER_MEASURE_COLUMNS, QuarterDemandRollupRow, "add_demand"),
+    (
+        RequestConversationHourlyRollup,
+        _CONVERSATION_KEY_COLUMNS + _CONVERSATION_MEASURE_COLUMNS,
+        ConversationHourlyRollupRow,
+        "add_conversations",
+    ),
 )
 
 
@@ -670,7 +985,11 @@ async def mirror_account_soft_delete_into_time_rollups(session: AsyncSession, ac
     is_deleted=true)` dimension (merge-added — an orphaned-deleted bucket
     may already exist).
     The error satellite has no `is_deleted` dimension (its read includes
-    soft-deleted rows), so only `account_id` is re-keyed there.
+    soft-deleted rows), so only `account_id` is re-keyed there. The
+    conversation satellite carries `account_id` precisely so this mirror can
+    re-attribute presence the way the raw UPDATE does — the dashboard
+    conversation reads (which exclude soft-deleted rows) then stop counting
+    it while the reports reads (which include them) keep it.
     """
 
     def _rekey(row):

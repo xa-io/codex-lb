@@ -4,10 +4,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
-from sqlalchemy import BigInteger, Integer, cast, delete, func, select, true, update
+from sqlalchemy import BigInteger, Integer, cast, delete, func, insert, literal, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only, selectinload
+from sqlalchemy.orm import load_only, raiseload, selectinload
 
 from app.core.utils.time import utcnow
 from app.db.models import (
@@ -167,6 +168,46 @@ class ApiKeysRepository:
         result = await self._session.execute(self._select_api_key().where(ApiKey.id == key_id))
         return result.scalar_one_or_none()
 
+    async def get_for_limit_enforcement(self, key_id: str) -> ApiKey | None:
+        """Admission-path load for ``enforce_limits_for_request``.
+
+        The enforcement transaction reads only ``is_active``/``expires_at``
+        plus the ``limits`` collection, so this skips the
+        ``account_assignments``/``source_assignments`` selectin round trips
+        that ``get_by_id`` pays on every proxied request. ``raiseload`` keeps
+        the narrowing fail-loud: any future enforcement code that touches an
+        unlisted column or relationship raises instead of silently lazy
+        loading. ``populate_existing`` stays required because the lazy limit
+        reset commits mid-enforcement and the refetch must re-hydrate rows
+        already in the identity map (sessions use ``expire_on_commit=False``).
+
+        Session-isolation invariant: ``populate_existing`` + ``raiseload``
+        would poison a *fully loaded* ``ApiKey`` already in this session's
+        identity map — re-populating it flips its unlisted columns and
+        relationships into raise-on-access state for every other holder of
+        that instance. That is unreachable today because every caller runs
+        this query in a dedicated short-lived session that never full-loads
+        an ``ApiKey`` first (``_enforce_request_limits`` and the websocket
+        reservation path open fresh background sessions/repo bundles; the
+        quota-planner warmup session never loads ``ApiKey`` rows), and the
+        only prior instance this query can re-populate is the one it loaded
+        itself with these same options. Do not call this on a session that
+        may already hold a fully loaded ``ApiKey`` (e.g. via ``get_by_id`` /
+        ``get_by_hash``) without dropping the narrowing first.
+        """
+        result = await self._session.execute(
+            select(ApiKey)
+            .execution_options(populate_existing=True)
+            .options(
+                load_only(ApiKey.is_active, ApiKey.expires_at, raiseload=True),
+                selectinload(ApiKey.limits),
+                raiseload(ApiKey.account_assignments),
+                raiseload(ApiKey.source_assignments),
+            )
+            .where(ApiKey.id == key_id)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_hash(self, key_hash: str) -> ApiKey | None:
         result = await self._session.execute(self._select_api_key().where(ApiKey.key_hash == key_hash))
         return result.scalar_one_or_none()
@@ -182,6 +223,11 @@ class ApiKeysRepository:
             select(Account)
             .options(load_only(Account.id, Account.plan_type, Account.status))
             .where(Account.id.in_(account_ids))
+            # An account marked for background deletion is already deleted
+            # from the operator's point of view: assignment validation must
+            # reject it (the synchronous delete removed the row outright) and
+            # pooled-usage projections must not count it while its rows drain.
+            .where(Account.delete_requested_at.is_(None))
         )
         return list(result.scalars().all())
 
@@ -198,6 +244,11 @@ class ApiKeysRepository:
             .where(
                 ~Account.status.in_((AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED))
             )
+            # Status alone is not enough: an unfenced pre-upgrade replica can
+            # briefly replace a marked account's terminal status during a
+            # rolling deploy, and a deleted account must never re-enter the
+            # unscoped pooled-usage projections.
+            .where(Account.delete_requested_at.is_(None))
         )
         return list(result.scalars().all())
 
@@ -303,6 +354,7 @@ class ApiKeysRepository:
         apply_to_codex_model: bool | _Unset = _UNSET,
         enforced_model: str | None | _Unset = _UNSET,
         enforced_reasoning_effort: str | None | _Unset = _UNSET,
+        allowed_reasoning_efforts: str | None | _Unset = _UNSET,
         enforced_service_tier: str | None | _Unset = _UNSET,
         traffic_class: str | _Unset = _UNSET,
         transport_policy_override: str | None | _Unset = _UNSET,
@@ -333,6 +385,9 @@ class ApiKeysRepository:
         if enforced_reasoning_effort is not _UNSET:
             assert enforced_reasoning_effort is None or isinstance(enforced_reasoning_effort, str)
             row.enforced_reasoning_effort = enforced_reasoning_effort
+        if allowed_reasoning_efforts is not _UNSET:
+            assert allowed_reasoning_efforts is None or isinstance(allowed_reasoning_efforts, str)
+            row.allowed_reasoning_efforts = allowed_reasoning_efforts
         if enforced_service_tier is not _UNSET:
             assert enforced_service_tier is None or isinstance(enforced_service_tier, str)
             row.enforced_service_tier = enforced_service_tier
@@ -376,13 +431,14 @@ class ApiKeysRepository:
         await self._session.commit()
         return True
 
+    async def commit(self) -> None:
+        await self._session.commit()
+
     async def update_last_used(self, key_id: str, *, commit: bool = True) -> None:
+        """Compatibility touch for maintenance and durability checks."""
         await self._session.execute(update(ApiKey).where(ApiKey.id == key_id).values(last_used_at=utcnow()))
         if commit:
             await self._session.commit()
-
-    async def commit(self) -> None:
-        await self._session.commit()
 
     async def rollback(self) -> None:
         await self._session.rollback()
@@ -434,9 +490,33 @@ class ApiKeysRepository:
         return await self.get_limits_by_key(key_id)
 
     async def replace_account_assignments(self, key_id: str, account_ids: list[str], *, commit: bool = True) -> None:
+        # Re-check the pending-deletion marker atomically with the write:
+        # validation ran in an earlier transaction, and an account DELETE can
+        # commit in between — the marked row still exists (background drain),
+        # so a plain FK insert would succeed and resurrect an assignment
+        # begin_delete just removed. The FOR SHARE lock (PostgreSQL)
+        # conflicts with begin_delete's row update, so either this
+        # transaction commits first (and begin_delete's assignment cleanup
+        # removes its rows) or the marker is visible below and the account is
+        # skipped. The account locks are taken BEFORE the assignment-row
+        # delete to match begin_delete's order (account row, then assignment
+        # rows) — taking them after would form a lock cycle with a
+        # concurrent begin_delete and deadlock. SQLite serializes writers,
+        # so the marker predicate alone is race-free there.
+        if account_ids and self._session.get_bind().dialect.name == "postgresql":
+            await self._session.execute(
+                select(Account.id).where(Account.id.in_(account_ids)).with_for_update(read=True)
+            )
         await self._session.execute(delete(ApiKeyAccountAssignment).where(ApiKeyAccountAssignment.api_key_id == key_id))
-        for account_id in account_ids:
-            self._session.add(ApiKeyAccountAssignment(api_key_id=key_id, account_id=account_id))
+        if account_ids:
+            assignment_source = (
+                select(literal(key_id), Account.id)
+                .where(Account.id.in_(account_ids))
+                .where(Account.delete_requested_at.is_(None))
+            )
+            await self._session.execute(
+                insert(ApiKeyAccountAssignment).from_select(["api_key_id", "account_id"], assignment_source)
+            )
         if commit:
             await self._session.commit()
         parent = await self._session.get(ApiKey, key_id)
@@ -475,7 +555,6 @@ class ApiKeysRepository:
                     .where(ApiKeyLimit.id == limit.id)
                     .values(current_value=ApiKeyLimit.current_value + increment)
                 )
-        await self._session.execute(update(ApiKey).where(ApiKey.id == key_id).values(last_used_at=utcnow()))
         await self._session.commit()
 
     async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
@@ -600,6 +679,11 @@ class ApiKeysRepository:
         model: str,
         items: list[UsageReservationItemData],
     ) -> None:
+        # Reservation accounting keeps full commit durability. On external/HA
+        # PostgreSQL a server failover does not kill in-flight application
+        # requests, so an acked-but-lost commit here would desynchronize the
+        # reservation ledger from requests that still complete (settlement
+        # invariant).
         reservation = ApiKeyUsageReservation(
             id=reservation_id,
             api_key_id=key_id,
@@ -732,6 +816,13 @@ class ApiKeysRepository:
         cached_input_tokens: int | None,
         cost_microdollars: int | None,
     ) -> None:
+        # Reservation accounting keeps full commit durability. Settlement
+        # (finalize/fail/release) is what puts completed-request usage on the
+        # books: on external/HA PostgreSQL a failover does not kill the
+        # application request, so an acked-but-lost settlement commit would
+        # leave the reservation "reserved" until the stale-release scheduler
+        # reverses the counters and records zero actual usage — dropping a
+        # completed request from token/cost/rate-limit accounting.
         await self._session.execute(
             update(ApiKeyUsageReservation)
             .where(ApiKeyUsageReservation.id == reservation_id)
@@ -758,17 +849,29 @@ class ApiKeysRepository:
         self,
         *,
         cutoff: datetime,
+        max_age_cutoff: datetime | None = None,
         batch_size: int = _STALE_USAGE_RESERVATION_RELEASE_BATCH_SIZE,
     ) -> int:
         released_count = 0
+
+        # ``cutoff`` reclaims reservations whose heartbeat stopped refreshing
+        # ``updated_at``. ``max_age_cutoff`` is the backstop for orphaned
+        # heartbeats (issue #1594): a leaked heartbeat task keeps touching
+        # ``updated_at`` forever, so reservations older than this hard ceiling
+        # on ``created_at`` are reclaimed regardless of heartbeat activity.
+        def _stale_clause(query: Any) -> Any:
+            stale = ApiKeyUsageReservation.updated_at < cutoff
+            if max_age_cutoff is not None:
+                stale = or_(stale, ApiKeyUsageReservation.created_at < max_age_cutoff)
+            return query.where(stale)
 
         try:
             while True:
                 async with sqlite_writer_section():
                     result = await self._session.execute(
-                        select(ApiKeyUsageReservation.id)
-                        .where(ApiKeyUsageReservation.status == "reserved")
-                        .where(ApiKeyUsageReservation.updated_at < cutoff)
+                        _stale_clause(
+                            select(ApiKeyUsageReservation.id).where(ApiKeyUsageReservation.status == "reserved")
+                        )
                         .order_by(ApiKeyUsageReservation.updated_at.asc())
                         .limit(batch_size)
                     )
@@ -776,6 +879,13 @@ class ApiKeysRepository:
                     if not reservation_ids:
                         break
 
+                    # Reservation accounting keeps full commit durability:
+                    # each batch flips reservation status and reverses limit
+                    # counters, mutating the same ledger as the request-path
+                    # settlement, so its durability must not depend on which
+                    # path settles the row. On external/HA PostgreSQL an
+                    # acked-but-lost batch commit silently reverts rows the
+                    # scheduler already reported as released.
                     item_result = await self._session.execute(
                         select(
                             ApiKeyUsageReservationItem.reservation_id,
@@ -802,10 +912,11 @@ class ApiKeysRepository:
 
                     for reservation_id in reservation_ids:
                         claimed = await self._session.execute(
-                            update(ApiKeyUsageReservation)
-                            .where(ApiKeyUsageReservation.id == reservation_id)
-                            .where(ApiKeyUsageReservation.status == "reserved")
-                            .where(ApiKeyUsageReservation.updated_at < cutoff)
+                            _stale_clause(
+                                update(ApiKeyUsageReservation)
+                                .where(ApiKeyUsageReservation.id == reservation_id)
+                                .where(ApiKeyUsageReservation.status == "reserved")
+                            )
                             .values(
                                 status="released",
                                 input_tokens=None,

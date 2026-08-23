@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from typing import cast as typing_cast
 
 import anyio
-from sqlalchemy import Integer, String, and_, case, cast, func, literal_column, or_, select
+from sqlalchemy import Integer, String, and_, case, cast, func, insert, or_, select
 from sqlalchemy import exc as sa_exc
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.orm import InstrumentedAttribute, make_transient_to_detached
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.core.usage.logs import RequestLogLike, calculated_cost_from_log
+from app.core.usage.logs import (
+    CANCELLED_STATUS,
+    CLIENT_DISCONNECT_ERROR_CODE,
+    NON_ERROR_STATUSES,
+    RequestLogLike,
+    calculated_cost_from_log,
+)
 from app.core.usage.types import (
     BucketConversationAggregate,
     BucketModelAggregate,
@@ -21,21 +29,34 @@ from app.core.usage.types import (
 )
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountUsageRollupState, ApiKey, RequestKind, RequestLog, RequestUsageHourlyRollup
-from app.db.session import sqlite_writer_section
+from app.db.models import (
+    Account,
+    AccountUsageRollupState,
+    ApiKey,
+    RequestDemandQuarterRollup,
+    RequestKind,
+    RequestLog,
+    RequestUsageHourlyErrorRollup,
+    RequestUsageHourlyRollup,
+)
+from app.db.session import relax_commit_durability, sqlite_writer_section
 from app.modules.accounts.usage_rollup import lock_fold_state
 from app.modules.accounts.usage_time_rollup import (
     HOURLY_BUCKET_SECONDS,
     WARMUP_REQUEST_KINDS,
+    conversation_id_expr,
     floor_to_hour,
     from_dimension,
+    to_dimension,
 )
 from app.modules.accounts.usage_time_rollup_read import (
     RawWindow,
+    conversation_presence_union,
     earliest_hourly_bucket_at,
     raw_windows_clause,
     read_errors_window,
     read_hourly_window,
+    sum_demand_window,
 )
 
 
@@ -43,6 +64,50 @@ from app.modules.accounts.usage_time_rollup_read import (
 class _RequestLogFilters:
     conditions: list
     needs_related_search_joins: bool
+
+
+# Earliest representable listing lower bound for the rollup-count window.
+_ROLLUP_EPOCH = datetime(1970, 1, 1)
+
+# Column keys for the Core request-log insert in ``add_log``. Every non-PK
+# column is read off the fully built transient instance; columns ``add_log``
+# never sets are nullable with no Python/server default the flush would have
+# applied, so an explicit NULL is identical to the old unit-of-work insert.
+_REQUEST_LOG_INSERT_COLUMN_KEYS: tuple[str, ...] = tuple(
+    column.key for column in RequestLog.__table__.columns if column.key != "id"
+)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """FastAPI parses ISO `Z` query bounds as offset-aware datetimes;
+    ``requested_at`` and the rollup grid are naive UTC, so normalize before
+    any window arithmetic (the SQL filter comparisons already coerce)."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+@dataclass(frozen=True, slots=True)
+class _DemandCountParams:
+    """Listing filters that map losslessly onto demand-rollup dimensions.
+
+    Built only when the listing carries no free-text search and no
+    error-code splits — the demand grain has no error_code dimension, and
+    search reaches related tables. Everything else (time bounds, accounts,
+    api keys, model/effort pairs, statuses, soft-delete exclusion) is a
+    demand dimension, so the folded window can be counted from the rollup.
+    """
+
+    since: datetime | None
+    until: datetime | None
+    account_ids: list[str] | None
+    api_key_ids: list[str] | None
+    model_options: list[tuple[str, str | None]] | None
+    models: list[str] | None
+    reasoning_efforts: list[str] | None
+    include_success: bool
+    include_cancelled: bool
+    include_error_other: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,11 +230,7 @@ class RequestLogsRepository:
 
     @staticmethod
     def _conversation_id_expr() -> ColumnElement:
-        trimmed = func.ltrim(
-            func.rtrim(RequestLog.conversation_id, _CONVERSATION_WHITESPACE),
-            _CONVERSATION_WHITESPACE,
-        )
-        return func.nullif(trimmed, "")
+        return conversation_id_expr()
 
     def _conversation_output_expr(self) -> ColumnElement:
         return func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)
@@ -536,8 +597,8 @@ class RequestLogsRepository:
         # granularity degrades to the full raw scan.
         merged: dict[tuple[int, str, str | None], list[float]] = {}
 
-        def _add(key: tuple[int, str, str | None], values: tuple[int, int, int, int, int, int, float]) -> None:
-            entry = merged.setdefault(key, [0, 0, 0, 0, 0, 0, 0.0])
+        def _add(key: tuple[int, str, str | None], values: tuple[int, int, int, int, int, int, int, float]) -> None:
+            entry = merged.setdefault(key, [0, 0, 0, 0, 0, 0, 0, 0.0])
             for index, value in enumerate(values):
                 entry[index] += value
 
@@ -558,6 +619,7 @@ class RequestLogsRepository:
                     (
                         rollup.request_count,
                         rollup.error_count,
+                        rollup.cancelled_count,
                         rollup.input_tokens,
                         rollup.output_tokens,
                         rollup.cached_input_tokens,
@@ -573,7 +635,8 @@ class RequestLogsRepository:
                     RequestLog.model,
                     RequestLog.service_tier,
                     func.count().label("request_count"),
-                    func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)).label("error_count"),
+                    func.sum(cast(RequestLog.status.not_in(NON_ERROR_STATUSES), Integer)).label("error_count"),
+                    func.sum(cast(RequestLog.status == CANCELLED_STATUS, Integer)).label("cancelled_count"),
                     func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
                     func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
                     func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
@@ -590,6 +653,7 @@ class RequestLogsRepository:
                     (
                         int(row.request_count),
                         int(row.error_count),
+                        int(row.cancelled_count),
                         int(row.input_tokens),
                         int(row.output_tokens),
                         int(row.cached_input_tokens),
@@ -604,11 +668,12 @@ class RequestLogsRepository:
                 service_tier=key[2],
                 request_count=int(entry[0]),
                 error_count=int(entry[1]),
-                input_tokens=int(entry[2]),
-                output_tokens=int(entry[3]),
-                cached_input_tokens=int(entry[4]),
-                reasoning_tokens=int(entry[5]),
-                cost_usd=float(entry[6]),
+                cancelled_count=int(entry[2]),
+                input_tokens=int(entry[3]),
+                output_tokens=int(entry[4]),
+                cached_input_tokens=int(entry[5]),
+                reasoning_tokens=int(entry[6]),
+                cost_usd=float(entry[7]),
             )
             for key, entry in sorted(merged.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or ""))
         ]
@@ -618,22 +683,40 @@ class RequestLogsRepository:
         since: datetime,
         bucket_seconds: int = 21600,
     ) -> list[BucketConversationAggregate]:
-        bucket_expr = self._bucket_epoch_expr(bucket_seconds)
-        bucket_col = bucket_expr.label("bucket_epoch")
-        conversation_id = self._conversation_id_expr()
-        stmt = (
-            select(
-                bucket_col,
-                func.count(func.distinct(conversation_id)).label("conversation_count"),
+        # Hour-multiple display buckets merge the conversation satellite with
+        # the raw tail in one UNION statement: COUNT(DISTINCT) over the merge
+        # dedups a conversation present on both sides of the fold boundary
+        # within one display bucket. Any other granularity degrades to the
+        # legacy full-raw scan (a display bucket would split a folded hour).
+        if bucket_seconds > 0 and bucket_seconds % HOURLY_BUCKET_SECONDS == 0:
+            union = conversation_presence_union(
+                self._session,
+                since,
+                include_deleted=False,
+                raw_conditions=self._eligible_conversation_row_conditions(),
+                display_bucket_seconds=bucket_seconds,
+            ).subquery()
+            stmt = (
+                select(union.c.bucket_epoch, func.count(func.distinct(union.c.cid)).label("conversation_count"))
+                .group_by(union.c.bucket_epoch)
+                .order_by(union.c.bucket_epoch)
             )
-            .where(
-                RequestLog.requested_at >= since,
-                *self._eligible_conversation_row_conditions(),
-                conversation_id.is_not(None),
+        else:
+            bucket_col = self._bucket_epoch_expr(bucket_seconds).label("bucket_epoch")
+            conversation_id = self._conversation_id_expr()
+            stmt = (
+                select(
+                    bucket_col,
+                    func.count(func.distinct(conversation_id)).label("conversation_count"),
+                )
+                .where(
+                    RequestLog.requested_at >= since,
+                    *self._eligible_conversation_row_conditions(),
+                    conversation_id.is_not(None),
+                )
+                .group_by(bucket_col)
+                .order_by(bucket_col)
             )
-            .group_by(bucket_col)
-            .order_by(bucket_col)
-        )
         result = await self._session.execute(stmt)
         return [
             BucketConversationAggregate(
@@ -669,7 +752,7 @@ class RequestLogsRepository:
             totals_stmt = select(
                 func.count().label("request_count"),
                 func.coalesce(
-                    func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)),
+                    func.sum(cast(RequestLog.status.not_in(NON_ERROR_STATUSES), Integer)),
                     0,
                 ).label("error_count"),
                 func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
@@ -689,20 +772,23 @@ class RequestLogsRepository:
             cost_usd += float(row.cost_usd or 0.0)
 
         # Distinct conversation counts are not additive across the fold
-        # boundary, so they always come from raw over the FULL window (a
-        # documented non-goal: they only reach as far back as retention keeps
-        # raw rows). This splits the legacy single-statement read in two —
+        # boundary, so they merge the conversation satellite with the raw
+        # tail via UNION ALL in one statement: COUNT(DISTINCT) dedups a
+        # conversation straddling the boundary, SUM(request_count) stays
+        # additive. This keeps the legacy read split in two statements —
         # totals and conversation metrics can straddle a concurrent insert,
         # which the periodically-polled dashboard tolerates.
+        union = conversation_presence_union(
+            self._session,
+            since,
+            until,
+            include_deleted=False,
+            raw_conditions=self._eligible_conversation_row_conditions(),
+        ).subquery()
         conversation_stmt = select(
-            func.count(func.distinct(self._conversation_id_expr())).label("conversation_count"),
-            func.count(self._conversation_id_expr()).label("conversation_request_count"),
-        ).where(
-            RequestLog.requested_at >= since,
-            *self._eligible_conversation_row_conditions(),
+            func.count(func.distinct(union.c.cid)).label("conversation_count"),
+            func.coalesce(func.sum(union.c.request_count), 0).label("conversation_request_count"),
         )
-        if until is not None:
-            conversation_stmt = conversation_stmt.where(RequestLog.requested_at < until)
         conversation_row = (await self._session.execute(conversation_stmt)).one()
 
         return RequestActivityAggregate(
@@ -712,9 +798,35 @@ class RequestLogsRepository:
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
             cost_usd=cost_usd,
+            cancelled_count=await self._cancelled_count(since, until),
             conversation_count=int(conversation_row.conversation_count or 0),
             conversation_request_count=int(conversation_row.conversation_request_count or 0),
         )
+
+    async def _cancelled_count(self, since: datetime, until: datetime | None) -> int:
+        # Sourced from the demand rollup (status is a dimension there, unlike
+        # the hourly rollup, and it has carried the full status grain across
+        # all folded history), so the cancelled breakdown is accurate even
+        # for buckets folded before the hourly `cancelled_count` measure
+        # existed and stays consistent with the demand-served listing totals.
+        folded_total, raw_windows = await sum_demand_window(
+            self._session,
+            since,
+            until,
+            filters=(
+                RequestDemandQuarterRollup.status == CANCELLED_STATUS,
+                RequestDemandQuarterRollup.request_kind.not_in(WARMUP_REQUEST_KINDS),
+            ),
+        )
+        if not raw_windows:
+            return folded_total
+        tail_stmt = select(func.count()).where(
+            raw_windows_clause(raw_windows),
+            self._exclude_warmup_clause(),
+            RequestLog.status == CANCELLED_STATUS,
+        )
+        tail_total = (await self._session.execute(tail_stmt)).scalar_one()
+        return folded_total + int(tail_total)
 
     async def top_error_since(self, since: datetime) -> str | None:
         return await self._top_error(since, None)
@@ -746,13 +858,17 @@ class RequestLogsRepository:
         # SELECT and reduced it in Python, which was internally consistent;
         # separate statements under READ COMMITTED are not). The grouped
         # result stays tiny (models x error codes) and everything derives
-        # from it in Python.
-        is_error_expr = (RequestLog.status != literal_column("'success'")).label("is_error")
+        # from it in Python. Cancelled terminals are classified out of the
+        # error fold (they are normal client disconnects, not upstream
+        # failures) and counted separately.
+        is_error_expr = RequestLog.status.not_in(NON_ERROR_STATUSES).label("is_error")
+        is_cancelled_expr = (RequestLog.status == CANCELLED_STATUS).label("is_cancelled")
         rows = (
             await self._session.execute(
                 select(
                     RequestLog.model,
                     is_error_expr,
+                    is_cancelled_expr,
                     RequestLog.error_code,
                     func.count().label("request_count"),
                     func.coalesce(func.sum(tokens_expr), 0).label("total_tokens"),
@@ -761,18 +877,29 @@ class RequestLogsRepository:
                     func.count(RequestLog.cost_usd).label("cost_count"),
                 )
                 .where(*window)
-                .group_by(RequestLog.model, is_error_expr, RequestLog.error_code)
+                .group_by(RequestLog.model, is_error_expr, is_cancelled_expr, RequestLog.error_code)
             )
         ).all()
 
         request_count = 0
         error_count = 0
+        cancelled_count = 0
         total_tokens = 0
         cached_input_tokens = 0
         error_code_counts: dict[str, int] = {}
         cost_sums: dict[str, float] = {}
         cost_counts: dict[str, int] = {}
-        for model, is_error, error_code, group_count, group_tokens, group_cached, group_cost, cost_count in rows:
+        for (
+            model,
+            is_error,
+            is_cancelled,
+            error_code,
+            group_count,
+            group_tokens,
+            group_cached,
+            group_cost,
+            cost_count,
+        ) in rows:
             group_count = int(group_count or 0)
             request_count += group_count
             total_tokens += int(group_tokens or 0)
@@ -781,6 +908,8 @@ class RequestLogsRepository:
                 error_count += group_count
                 if error_code:
                     error_code_counts[error_code] = error_code_counts.get(error_code, 0) + group_count
+            elif is_cancelled:
+                cancelled_count += group_count
             cost_sums[model] = cost_sums.get(model, 0.0) + float(group_cost or 0.0)
             cost_counts[model] = cost_counts.get(model, 0) + int(cost_count or 0)
 
@@ -793,6 +922,7 @@ class RequestLogsRepository:
         return UsageSummaryLogsAggregate(
             request_count=request_count,
             error_count=error_count,
+            cancelled_count=cancelled_count,
             total_tokens=total_tokens,
             cached_input_tokens=cached_input_tokens,
             top_error=top_error,
@@ -807,8 +937,16 @@ class RequestLogsRepository:
     async def _top_error(self, since: datetime, until: datetime | None) -> str | None:
         # The error satellite was folded with this exact filter set (warmup
         # kinds excluded, soft-deleted rows INCLUDED, error_code NOT NULL);
-        # only the account dimension needs summing over here.
-        error_rows, raw_windows = await read_errors_window(self._session, since, until)
+        # only the account dimension needs summing over here. Buckets folded
+        # before cancelled terminals left the error fold still carry their
+        # client_disconnected counts — dropping that code read-side keeps
+        # top_error on genuinely-failed terminals without a backfill.
+        error_rows, raw_windows = await read_errors_window(
+            self._session,
+            since,
+            until,
+            filters=(RequestUsageHourlyErrorRollup.error_code != CLIENT_DISCONNECT_ERROR_CODE,),
+        )
         counts: dict[str, int] = {}
         for error in error_rows:
             counts[error.error_code] = counts.get(error.error_code, 0) + error.error_count
@@ -818,7 +956,7 @@ class RequestLogsRepository:
                 .where(
                     raw_windows_clause(raw_windows),
                     self._exclude_warmup_clause(),
-                    RequestLog.status != "success",
+                    RequestLog.status.not_in(NON_ERROR_STATUSES),
                     RequestLog.error_code.is_not(None),
                 )
                 .group_by(RequestLog.error_code)
@@ -896,6 +1034,7 @@ class RequestLogsRepository:
         cost_usd: float | None = None,
         bridge_stage: str | None = None,
         request_kind: str = RequestKind.NORMAL.value,
+        connection_request_kind: str | None = None,
         upstream_proxy_route_mode: str | None = None,
         upstream_proxy_pool_id: str | None = None,
         upstream_proxy_endpoint_id: str | None = None,
@@ -904,6 +1043,9 @@ class RequestLogsRepository:
         archive_request_id: str | None = None,
     ) -> RequestLog:
         async with sqlite_writer_section():
+            # Telemetry write: this transaction only appends one request-log
+            # row, so its commit may skip the synchronous WAL flush.
+            await relax_commit_durability(self._session)
             resolved_request_id = ensure_request_id(request_id)
             resolved_archive_request_id = (archive_request_id or "").strip() or resolved_request_id
             resolved_plan_type = plan_type
@@ -929,6 +1071,7 @@ class RequestLogsRepository:
                 transport=transport,
                 upstream_transport=upstream_transport,
                 request_kind=request_kind,
+                connection_request_kind=connection_request_kind,
                 useragent=resolved_useragent,
                 useragent_group=resolved_useragent_group,
                 conversation_id=resolved_conversation_id,
@@ -975,12 +1118,28 @@ class RequestLogsRepository:
                 if model_source_id is not None
                 else calculated_cost_from_log(typing_cast(RequestLogLike, log))
             )
-            self._session.add(log)
+            # Core insert instead of unit-of-work: the row is fully built
+            # above, so the ORM flush (relationship cascade scan,
+            # per-attribute history snapshots) is pure overhead on every
+            # request's log write. No refresh: every column is set explicitly
+            # before insert. Once the primary key is known, the instance is
+            # re-attached as *persistent* (clean, no pending SQL) so callers
+            # that mutate the returned log and commit through the same
+            # session get a tracked UPDATE instead of a silent no-op
+            # (sessions run with ``expire_on_commit=False``, so the attach
+            # never triggers post-commit lazy loads).
+            insert_values = {key: getattr(log, key) for key in _REQUEST_LOG_INSERT_COLUMN_KEYS}
             try:
+                result = typing_cast(
+                    CursorResult[Any],
+                    await self._session.execute(insert(RequestLog).values(insert_values)),
+                )
+                inserted_primary_key = result.inserted_primary_key
+                if inserted_primary_key is not None and inserted_primary_key[0] is not None:
+                    log.id = int(inserted_primary_key[0])
+                    make_transient_to_detached(log)
+                    self._session.add(log)
                 await self._session.commit()
-                # No refresh: every column is set explicitly before insert and
-                # expire_on_commit=False, so the round trip was pure overhead
-                # on every request's log write.
                 return log
             except sa_exc.ResourceClosedError:
                 return log
@@ -1007,7 +1166,9 @@ class RequestLogsRepository:
         A matching row below the watermarks can only be a client-reused
         request id colliding with unrelated old traffic — the rewrite's
         target is the row the caller inserted moments ago. The fold-state
-        lock serializes this against an in-flight fold slice.
+        lock serializes this against an in-flight fold slice. The
+        conversation satellite needs no bound here: neither ``model`` nor
+        ``cost_usd`` is folded into it.
 
         Returns the number of rows that were updated.
         """
@@ -1072,12 +1233,15 @@ class RequestLogsRepository:
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
         include_success: bool = True,
+        include_cancelled: bool = True,
         include_error_other: bool = True,
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
         *,
         include_sensitive_metadata: bool = True,
     ) -> RequestLogsResult:
+        since = _naive_utc(since) if since is not None else None
+        until = _naive_utc(until) if until is not None else None
         filters = self._build_filters(
             search=search,
             since=since,
@@ -1089,6 +1253,7 @@ class RequestLogsRepository:
             models=models,
             reasoning_efforts=reasoning_efforts,
             include_success=include_success,
+            include_cancelled=include_cancelled,
             include_error_other=include_error_other,
             error_codes_in=error_codes_in,
             error_codes_excluding=error_codes_excluding,
@@ -1111,9 +1276,24 @@ class RequestLogsRepository:
             total, aggregated_cost_usd = await self._count_and_sum_recent(filters)
             return RequestLogsResult(logs=logs, total=total, aggregated_cost_usd=aggregated_cost_usd)
 
+        demand_params: _DemandCountParams | None = None
+        if search is None and not error_codes_in and not error_codes_excluding:
+            demand_params = _DemandCountParams(
+                since=since,
+                until=until,
+                account_ids=account_ids,
+                api_key_ids=api_key_ids,
+                model_options=model_options,
+                models=models,
+                reasoning_efforts=reasoning_efforts,
+                include_success=include_success,
+                include_cancelled=include_cancelled,
+                include_error_other=include_error_other,
+            )
+
         ttl_seconds = _COUNT_CACHE_TTL_SECONDS
         if ttl_seconds <= 0:
-            return RequestLogsResult(logs=logs, total=await self._count_recent(filters))
+            return RequestLogsResult(logs=logs, total=await self._count_recent(filters, demand_params))
         cache_key = (
             search,
             since,
@@ -1125,6 +1305,7 @@ class RequestLogsRepository:
             tuple(models or ()),
             tuple(reasoning_efforts or ()),
             include_success,
+            include_cancelled,
             include_error_other,
             tuple(sorted(error_codes_in)) if error_codes_in else None,
             tuple(sorted(error_codes_excluding)) if error_codes_excluding else None,
@@ -1132,7 +1313,7 @@ class RequestLogsRepository:
         )
         total = _cached_recent_count(cache_key)
         if total is None:
-            total = await self._count_recent(filters)
+            total = await self._count_recent(filters, demand_params)
             _store_recent_count(cache_key, total, ttl_seconds)
         return RequestLogsResult(logs=logs, total=total)
 
@@ -1148,13 +1329,113 @@ class RequestLogsRepository:
         request_count, aggregated_cost_usd = result.one()
         return int(request_count), float(aggregated_cost_usd)
 
-    async def _count_recent(self, filters: _RequestLogFilters) -> int:
+    async def _count_recent(
+        self,
+        filters: _RequestLogFilters,
+        demand_params: _DemandCountParams | None = None,
+    ) -> int:
+        if demand_params is not None:
+            return await self._count_recent_from_demand_rollup(filters, demand_params)
         count_stmt = select(func.count(RequestLog.id)).select_from(RequestLog)
         count_stmt = self._apply_related_search_joins(count_stmt, filters.needs_related_search_joins)
         if filters.conditions:
             count_stmt = count_stmt.where(and_(*filters.conditions))
         result = await self._session.execute(count_stmt)
         return int(result.scalar_one())
+
+    async def _count_recent_from_demand_rollup(
+        self,
+        filters: _RequestLogFilters,
+        params: _DemandCountParams,
+    ) -> int:
+        """Serve the listing total from the demand rollup plus the raw tail.
+
+        Every filter the listing exposes except free-text search and
+        error-code splits maps onto a demand-rollup dimension (status is a
+        dimension there, unlike the hourly rollup), so the folded part of
+        the window is one indexed SUM instead of a scan that grows with
+        history. The un-folded complement is counted from raw with the
+        exact listing conditions. With no watermark the folded sum is 0 and
+        the raw windows cover the whole range, which is the legacy count —
+        no kill switch needed.
+        """
+        rollup_filters: list = [RequestDemandQuarterRollup.is_deleted.is_(False)]
+        if params.account_ids:
+            rollup_filters.append(
+                RequestDemandQuarterRollup.account_id.in_([to_dimension(value) for value in params.account_ids])
+            )
+        if params.api_key_ids:
+            rollup_filters.append(
+                RequestDemandQuarterRollup.api_key_id.in_([to_dimension(value) for value in params.api_key_ids])
+            )
+        if params.model_options:
+            pair_filters = []
+            for model, effort in params.model_options:
+                base = (model or "").strip()
+                if not base:
+                    continue
+                pair_filters.append(
+                    and_(
+                        RequestDemandQuarterRollup.model == base,
+                        RequestDemandQuarterRollup.reasoning_effort == to_dimension(effort),
+                    )
+                )
+            if pair_filters:
+                rollup_filters.append(or_(*pair_filters))
+        else:
+            if params.models:
+                rollup_filters.append(RequestDemandQuarterRollup.model.in_(params.models))
+            if params.reasoning_efforts:
+                rollup_filters.append(
+                    RequestDemandQuarterRollup.reasoning_effort.in_(
+                        [to_dimension(value) for value in params.reasoning_efforts]
+                    )
+                )
+        statuses = []
+        if params.include_success:
+            statuses.append("success")
+        if params.include_cancelled:
+            statuses.append(CANCELLED_STATUS)
+        if params.include_error_other:
+            statuses.append("error")
+        if statuses:
+            rollup_filters.append(RequestDemandQuarterRollup.status.in_(statuses))
+
+        # Retention prunes raw rows but keeps their folded counts; the
+        # listing total must track listable rows, so clamp the rollup window
+        # to the earliest surviving live row (the slot containing it stays
+        # raw-served, excluding any partially pruned slot). A prune
+        # committing between this read and the sum can transiently overcount
+        # — the same cross-statement exposure every rollup reader accepts.
+        earliest_live = (
+            await self._session.execute(
+                select(func.min(RequestLog.requested_at)).where(RequestLog.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        rollup_since = params.since if params.since is not None else _ROLLUP_EPOCH
+        if earliest_live is None:
+            rollup_since = utcnow().replace(tzinfo=None)
+        else:
+            rollup_since = max(rollup_since, earliest_live)
+        # The listing's `until` bound is inclusive; the rollup window is
+        # half-open, so shift by the smallest representable step
+        # (datetime.max cannot be shifted — treat it as unbounded).
+        rollup_until = (
+            None if params.until is None or params.until == datetime.max else params.until + timedelta(microseconds=1)
+        )
+        folded_total, raw_windows = await sum_demand_window(
+            self._session,
+            rollup_since,
+            rollup_until,
+            filters=rollup_filters,
+        )
+        if not raw_windows:
+            return folded_total
+        tail_stmt = select(func.count(RequestLog.id)).select_from(RequestLog).where(raw_windows_clause(raw_windows))
+        if filters.conditions:
+            tail_stmt = tail_stmt.where(and_(*filters.conditions))
+        tail_total = (await self._session.execute(tail_stmt)).scalar_one()
+        return folded_total + int(tail_total)
 
     async def _resolve_account_plan_type(self, account_id: str) -> str | None:
         result = await self._session.execute(select(Account.plan_type).where(Account.id == account_id).limit(1))
@@ -1179,6 +1460,7 @@ class RequestLogsRepository:
             models=models,
             reasoning_efforts=reasoning_efforts,
             include_success=True,
+            include_cancelled=True,
             include_error_other=True,
             error_codes_in=None,
             error_codes_excluding=None,
@@ -1193,6 +1475,7 @@ class RequestLogsRepository:
             models=models,
             reasoning_efforts=reasoning_efforts,
             include_success=True,
+            include_cancelled=True,
             include_error_other=True,
             error_codes_in=None,
             error_codes_excluding=None,
@@ -1321,6 +1604,7 @@ class RequestLogsRepository:
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
         include_success: bool = True,
+        include_cancelled: bool = True,
         include_error_other: bool = True,
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
@@ -1362,6 +1646,8 @@ class RequestLogsRepository:
         status_conditions = []
         if include_success:
             status_conditions.append(RequestLog.status == "success")
+        if include_cancelled:
+            status_conditions.append(RequestLog.status == CANCELLED_STATUS)
         if error_codes_in:
             status_conditions.append(and_(RequestLog.status == "error", RequestLog.error_code.in_(error_codes_in)))
         if include_error_other:

@@ -1198,6 +1198,332 @@ async def test_request_log_conversation_id_migration_upgrade_and_downgrade(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_usage_history_bulk_covering_indexes_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'usage-history-bulk-covering.sqlite'}"
+    parent_revision = "20260730_000000_add_api_key_fair_share_threshold"
+    covering_revision = "20260806_020000_add_usage_history_bulk_covering_indexes"
+    covering_indexes = {
+        "idx_usage_window_account_time_covering",
+        "idx_usage_window_raw_account_time_covering",
+    }
+
+    async def _usage_history_indexes(engine) -> set[str]:
+        async with engine.connect() as conn:
+            return {row[1] for row in await conn.execute(text("PRAGMA index_list('usage_history')"))}
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        indexes = await _usage_history_indexes(engine)
+        assert not (covering_indexes & indexes)
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, covering_revision, bootstrap_legacy=False))
+        indexes = await _usage_history_indexes(engine)
+        assert covering_indexes <= indexes
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        indexes = await _usage_history_indexes(engine)
+        assert not (covering_indexes & indexes)
+
+        # Idempotent re-upgrade (IF NOT EXISTS tolerates pre-created indexes).
+        await to_thread.run_sync(lambda: run_upgrade(db_url, covering_revision, bootstrap_legacy=False))
+        indexes = await _usage_history_indexes(engine)
+        assert covering_indexes <= indexes
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _is_postgresql_database_url(_DATABASE_URL),
+    reason="PostgreSQL-only invalid covering-index repair test",
+)
+async def test_usage_history_covering_index_migration_repairs_invalid_leftover_postgresql(db_setup):
+    """An invalid leftover from an interrupted CREATE INDEX CONCURRENTLY is rebuilt.
+
+    ``IF NOT EXISTS`` alone would silently accept an invalid same-named index,
+    leaving the bulk fetch without a usable covering index. Pins the repair
+    probe: step the schema back below the covering revision, plant a decoy
+    key-only index marked invalid (exactly what an interrupted concurrent
+    build leaves behind), and assert the re-applied migration replaces it
+    with a valid covering index.
+    """
+    from alembic import command
+
+    from app.db.migrate import _build_alembic_config
+
+    parent_revision = "20260730_000000_add_api_key_fair_share_threshold"
+    index_name = "idx_usage_window_account_time_covering"
+
+    await run_startup_migrations(_DATABASE_URL)
+    await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(_DATABASE_URL), parent_revision))
+
+    async with SessionLocal() as session:
+        await session.execute(text(f"CREATE INDEX {index_name} ON usage_history (account_id)"))
+        await session.execute(
+            text("UPDATE pg_index SET indisvalid = false WHERE indexrelid = CAST(:name AS regclass)"),
+            {"name": index_name},
+        )
+        await session.commit()
+
+    result = await run_startup_migrations(_DATABASE_URL)
+    assert result.current_revision == _HEAD_REVISION
+
+    async with SessionLocal() as session:
+        indisvalid = (
+            await session.execute(
+                text(
+                    "SELECT i.indisvalid FROM pg_index i "
+                    "JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = :name"
+                ),
+                {"name": index_name},
+            )
+        ).scalar_one()
+        indexdef = (
+            await session.execute(
+                text("SELECT pg_get_indexdef(CAST(:name AS regclass))"),
+                {"name": index_name},
+            )
+        ).scalar_one()
+
+    assert indisvalid is True
+    assert "INCLUDE" in indexdef  # rebuilt as the covering index, not the accepted decoy
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _is_postgresql_database_url(_DATABASE_URL),
+    reason="PostgreSQL-only autovacuum reloptions test",
+)
+async def test_usage_history_autovacuum_tuning_migration_sets_and_resets_reloptions_postgresql(db_setup):
+    """The autovacuum tuning revision round-trips and tolerates manual pre-application.
+
+    ``usage_history`` is append-heavy, so a stale visibility map silently
+    degrades the covering indexes' index-only scans into per-row heap
+    fetches. Pins that the migration sets the insert-driven autovacuum
+    parameters, that downgrade resets them, and that re-applying over a
+    deployment that already carries the identical manual ``ALTER TABLE``
+    (the reference deployment's hotfix) is harmless.
+    """
+    from alembic import command
+
+    from app.db.migrate import _build_alembic_config
+
+    parent_revision = "20260806_020000_add_usage_history_bulk_covering_indexes"
+    expected_options = {
+        "autovacuum_vacuum_insert_scale_factor=0.02",
+        "autovacuum_vacuum_insert_threshold=50000",
+        "autovacuum_analyze_scale_factor=0.02",
+    }
+
+    async def _usage_history_reloptions() -> set[str]:
+        async with SessionLocal() as session:
+            options = (
+                await session.execute(text("SELECT reloptions FROM pg_class WHERE relname = 'usage_history'"))
+            ).scalar_one()
+            return set(options or ())
+
+    result = await run_startup_migrations(_DATABASE_URL)
+    assert result.current_revision == _HEAD_REVISION
+    assert expected_options <= await _usage_history_reloptions()
+
+    await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(_DATABASE_URL), parent_revision))
+    assert not (expected_options & await _usage_history_reloptions())
+
+    # Simulate the reference deployment's manual hotfix, then re-apply the
+    # migration on top of it: ALTER TABLE ... SET is idempotent.
+    async with SessionLocal() as session:
+        await session.execute(
+            text(
+                "ALTER TABLE usage_history SET ("
+                "autovacuum_vacuum_insert_scale_factor = 0.02, "
+                "autovacuum_vacuum_insert_threshold = 50000, "
+                "autovacuum_analyze_scale_factor = 0.02)"
+            )
+        )
+        await session.commit()
+
+    rerun = await run_startup_migrations(_DATABASE_URL)
+    assert rerun.current_revision == _HEAD_REVISION
+    assert expected_options <= await _usage_history_reloptions()
+
+
+@pytest.mark.asyncio
+async def test_account_pending_deletion_migration_upgrade_and_downgrade(tmp_path):
+    """Round-trip the pending-deletion marker migration through Alembic:
+    parent -> revision adds the two guarded marker columns and the partial
+    queue index, downgrade removes all three, the guarded upgrade tolerates
+    pre-existing columns, and an upgrade to head proves the revision sits on
+    the single-head path."""
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'account-pending-deletion.sqlite'}"
+    parent_revision = "20260812_120000_add_sticky_abandonment_scope"
+    pending_deletion_revision = "20260816_000000_add_account_pending_deletion"
+    marker_columns = {"delete_requested_at", "delete_history_requested"}
+    index_name = "idx_accounts_delete_requested_at"
+
+    def _schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        columns = {column["name"] for column in inspector.get_columns("accounts")}
+        indexes = {index["name"] for index in inspector.get_indexes("accounts")}
+        return {"columns": columns & marker_columns, "index_present": index_name in indexes}
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": set(), "index_present": False}
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, pending_deletion_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": marker_columns, "index_present": True}
+
+        # Downgrade refuses while a deletion is queued: the marker columns are
+        # the queue's only durable state, and dropping them would silently
+        # abandon an acknowledged deletion.
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO accounts (id, codex_installation_id, email, plan_type, "
+                    "access_token_encrypted, refresh_token_encrypted, id_token_encrypted, "
+                    "last_refresh, status, delete_requested_at, delete_history_requested) "
+                    "VALUES ('acc_mig_pending', 'install-mig-pending', 'mig@example.com', 'plus', "
+                    "X'00', X'00', X'00', '2026-08-16 00:00:00', 'deactivated', "
+                    "'2026-08-16 00:00:00', 0)"
+                )
+            )
+        with pytest.raises(Exception, match="queued for"):
+            await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": marker_columns, "index_present": True}
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM accounts WHERE id = 'acc_mig_pending'"))
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": set(), "index_present": False}
+
+        # Guarded upgrade: a database where the columns already exist (e.g. a
+        # pre-merge build of this revision) must upgrade cleanly and still
+        # create the missing index.
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE accounts ADD COLUMN delete_requested_at DATETIME"))
+        await to_thread.run_sync(lambda: run_upgrade(db_url, pending_deletion_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": marker_columns, "index_present": True}
+
+        # Single-head path: upgrading to head from here must succeed and keep
+        # the marker schema in place.
+        await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {"columns": marker_columns, "index_present": True}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_account_plan_downgrade_observations_migration_upgrade_and_downgrade(tmp_path):
+    """Round-trip the plan-downgrade evidence migration through Alembic itself.
+
+    The store tests build their schema through ``Base.metadata.create_all``, so
+    only this test executes the revision's ``upgrade`` and ``downgrade``
+    functions: parent -> revision creates the table with the expected shape,
+    downgrade removes it, the guarded upgrade tolerates a database where a
+    pre-merge build of this same revision already created the table, and a
+    final upgrade to ``head`` proves the re-parented revision sits on the
+    single-head path.
+    """
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'plan-downgrade-observations.sqlite'}"
+    parent_revision = "20260803_000000_merge_http_bridge_recovery_and_capability_lineage_heads"
+    observations_revision = "20260726_000000_add_account_plan_downgrade_observations"
+    table_name = "account_plan_downgrade_observations"
+    expected_columns = {
+        "account_id",
+        "observations",
+        "credential_fingerprint",
+        "observed_plan_type",
+        "first_observed_at",
+        "last_observed_at",
+    }
+
+    def _schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        present = inspector.has_table(table_name)
+        return {
+            "present": present,
+            "columns": ({column["name"] for column in inspector.get_columns(table_name)} if present else set()),
+            "pk": (inspector.get_pk_constraint(table_name)["constrained_columns"] if present else None),
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert not state["present"]
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, observations_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state["present"]
+        assert state["columns"] == expected_columns
+        assert state["pk"] == ["account_id"]
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert not state["present"]
+
+        # Guarded upgrade: a database where a pre-merge build of this same
+        # revision already created the table must upgrade cleanly without a
+        # second CREATE TABLE.
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "CREATE TABLE account_plan_downgrade_observations ("
+                    "account_id VARCHAR NOT NULL, observations INTEGER NOT NULL, "
+                    "credential_fingerprint VARCHAR(64) NOT NULL, observed_plan_type VARCHAR NOT NULL, "
+                    "first_observed_at DATETIME NOT NULL, last_observed_at DATETIME NOT NULL, "
+                    "PRIMARY KEY (account_id))"
+                )
+            )
+        await to_thread.run_sync(lambda: run_upgrade(db_url, observations_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state["present"]
+        assert state["columns"] == expected_columns
+
+        # The revision must sit on the single-head path: upgrading to head
+        # from here succeeds without a divergent-heads error and leaves the
+        # table in place.
+        await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state["present"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_request_usage_time_rollups_migration_upgrade_and_downgrade(tmp_path):
     from alembic import command
     from sqlalchemy import inspect as sa_inspect
@@ -1431,6 +1757,7 @@ async def test_stamped_merge_rollup_repair_downgrade_preserves_schema(tmp_path):
                         session_key_hash VARCHAR(64) NOT NULL,
                         api_key_scope VARCHAR(255) NOT NULL,
                         owner_instance_id VARCHAR(255),
+                        owner_process_epoch VARCHAR(64),
                         owner_epoch INTEGER NOT NULL DEFAULT 0,
                         lease_expires_at DATETIME,
                         state VARCHAR(16) NOT NULL DEFAULT 'active',
@@ -1461,5 +1788,123 @@ async def test_stamped_merge_rollup_repair_downgrade_preserves_schema(tmp_path):
         async with engine.connect() as conn:
             tables_after_downgrade = await conn.run_sync(lambda sync_conn: set(sa_inspect(sync_conn).get_table_names()))
         assert rollup_tables <= tables_after_downgrade
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_conversation_presence_rollup_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'conversation-presence-rollup.sqlite'}"
+    parent_revision = "20260806_000000_add_additional_usage_alias_probe_indexes"
+    rollup_revision = "20260806_010000_add_conversation_presence_rollup"
+    table = "request_conversation_hourly_rollups"
+
+    def _schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        return {
+            "has_table": inspector.has_table(table),
+            "state_columns": {column["name"] for column in inspector.get_columns("account_usage_rollup_state")},
+            "pk": (inspector.get_pk_constraint(table)["constrained_columns"] if inspector.has_table(table) else None),
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert not state["has_table"]
+        assert "conversation_folded_through" not in state["state_columns"]
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, rollup_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state["has_table"]
+        assert "conversation_folded_through" in state["state_columns"]
+        assert state["pk"] == ["bucket_epoch", "conversation_id", "account_id", "is_deleted"]
+
+        # The migration-seeded fold-state row (older revision) must have been
+        # backfilled to the epoch by the new column's server default — the
+        # satellite starts its own from-zero backfill — without touching the
+        # lifetime or hourly watermarks.
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT hourly_folded_through, conversation_folded_through "
+                        "FROM account_usage_rollup_state WHERE id = 1"
+                    )
+                )
+            ).one()
+        assert str(row[1]).startswith("1970-01-01")
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert not state["has_table"]
+        assert "conversation_folded_through" not in state["state_columns"]
+
+        # Idempotent re-upgrade.
+        await to_thread.run_sync(lambda: run_upgrade(db_url, rollup_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state["has_table"]
+        assert "conversation_folded_through" in state["state_columns"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_file_account_pins_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'file-account-pins.sqlite'}"
+    parent_revision = "20260806_000000_add_anonymous_telemetry"
+    pin_revision = "20260813_000000_add_file_account_pins"
+
+    def _schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        if not inspector.has_table("file_account_pins"):
+            return None
+        columns = inspector.get_columns("file_account_pins")
+        file_id_column = next(column for column in columns if column["name"] == "file_id")
+        return {
+            "columns": {column["name"] for column in columns},
+            "file_id_length": file_id_column["type"].length,
+            "primary_key": inspector.get_pk_constraint("file_account_pins")["constrained_columns"],
+            "indexes": {index["name"] for index in inspector.get_indexes("file_account_pins")},
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_schema_state) is None
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, pin_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+        assert state == {
+            "columns": {"file_id", "account_id", "expires_at"},
+            "file_id_length": None,
+            "primary_key": ["file_id"],
+            "indexes": {"ix_file_account_pins_expires_at"},
+        }
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_schema_state) is None
+
+        result = await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        assert result.current_revision == _HEAD_REVISION
+        async with engine.connect() as conn:
+            assert await conn.run_sync(_schema_state) is not None
     finally:
         await engine.dispose()
