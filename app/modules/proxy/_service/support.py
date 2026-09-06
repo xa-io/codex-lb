@@ -10,16 +10,19 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, NoReturn, Protocol
+from typing import Any, Literal, NoReturn, Protocol, cast
 
 import anyio
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyResponseError
-from app.core.clients.proxy_websocket import UpstreamWebSocket
+from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL,
+    UpstreamWebSocket,
+)
 from app.core.config.settings import get_settings
-from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.errors import OpenAIErrorEnvelope, OpenAIErrorParam, openai_error
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import classify_event_type
@@ -28,6 +31,7 @@ from app.core.resilience.network_recovery import PROCESS_NETWORK_UNAVAILABLE_COD
 from app.core.resilience.overload import is_local_overload_error_code
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
+from app.core.utils.locks import fast_lock
 from app.core.utils.sse import sse_event_type_from_block
 from app.db.models import Account
 from app.modules.api_keys.service import (
@@ -36,6 +40,7 @@ from app.modules.api_keys.service import (
     ApiKeyUsageReservationData,
 )
 from app.modules.proxy.affinity import _AffinityPolicy
+from app.modules.proxy.helpers import _normalize_error_code, _parse_openai_error
 from app.modules.proxy.load_balancer import (
     AccountLease,
     AccountSelection,
@@ -45,6 +50,7 @@ from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
 logger = logging.getLogger(__name__)
+
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
@@ -56,7 +62,13 @@ _TTFT_EVENT_TYPES = frozenset(
         "response.reasoning_text.delta",
     }
 )
-_TTFT_TOOL_DELTA_EVENT_TYPES = frozenset({"response.function_call_arguments.delta", "response.output_tool_call.delta"})
+_TTFT_TOOL_DELTA_EVENT_TYPES = frozenset(
+    {
+        "response.function_call_arguments.delta",
+        "response.output_tool_call.delta",
+        "response.custom_tool_call_input.delta",
+    }
+)
 _TTFT_REASONING_EVENT_TYPES = frozenset(
     {"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"}
 )
@@ -232,10 +244,16 @@ def _ttft_event_visible_at(
     if event_type in _TTFT_EVENT_TYPES:
         delta = payload.get("delta") if payload is not None else None
         return now if isinstance(delta, str) and bool(delta) else None
-    if event_type != "response.output_item.added" or not isinstance(payload, dict):
+    if event_type not in {"response.output_item.added", "response.output_item.done"} or not isinstance(payload, dict):
         return None
     item = payload.get("item")
-    return now if isinstance(item, dict) and item.get("type") in _TTFT_OUTPUT_ITEM_TYPES else None
+    if not isinstance(item, dict) or item.get("type") not in _TTFT_OUTPUT_ITEM_TYPES:
+        return None
+    if item.get("type") == "custom_tool_call":
+        meaningful = any(isinstance(item.get(key), str) and bool(item[key]) for key in ("input", "arguments"))
+    else:
+        meaningful = any(item.get(key) not in (None, "", {}) for key in ("operation", "patch", "input"))
+    return now if meaningful else None
 
 
 def _is_ttft_event(
@@ -812,6 +830,7 @@ class _StreamSettlement:
     error_message: str | None = None
     error: UpstreamError | None = None
     account_health_error: bool = False
+    settlement_order_required: bool = False
     record_success: bool = True
     downstream_visible: bool = False
     downstream_text_visible: bool = False
@@ -872,11 +891,25 @@ class _DeferredAccountBackoffTracker:
     current_lifecycle: _DeferredAccountBackoffLifecycle | None = None
 
 
+@dataclass(slots=True)
+class _DeferredKeyedStreamHealthPenalty:
+    """Classified account-health write deferred until reservation settlement."""
+
+    account: Account
+    error: UpstreamError
+    code: str
+
+
 @dataclass(eq=False, slots=True)
 class _HTTPBridgeResponseCreateAttempt:
     ordinal: int
     disarmed: bool = False
     response_observed: bool = False
+    # A non-terminal response event (a deferred-reasoning prelude, for
+    # example) proves the attempt was answered midstream even when ordinary
+    # event accounting was deliberately skipped. A later terminal failure
+    # frame must then not be charged as a pre-response strike.
+    non_terminal_response_observed: bool = False
     retry_circuit_failure_recorded: bool = False
     retry_circuit_failure_settled: anyio.Event | None = None
 
@@ -956,14 +989,10 @@ class _WebSocketRequestState:
     # ``_prepare_websocket_response_create_request`` (replays, archives),
     # which keeps those on the normalized-model check.
     raw_source_model: str | None = None
-    # True when the HTTP route would exclude this request from model-source
-    # routing (``responses_source_route_excluded``: a terminal compaction
-    # trigger, or ``input_file`` references pinned to the uploading
-    # subscription account). The WebSocket source-ownership guards skip such
-    # requests so the owner-routing logic can dispatch them to a subscription
-    # account, exactly like HTTP. ``False`` on request states that were not
-    # built by ``_prepare_websocket_response_create_request``, which keeps
-    # the guards active for those.
+    # True when the Codex HTTP route structurally excludes this request from
+    # model-source routing: a terminal compaction trigger or ``input_file``
+    # references pinned to the uploading subscription account. Previous
+    # response ownership is recorded separately after continuity lookup.
     source_route_excluded: bool = False
     request_usage_budget: ApiKeyRequestUsageBudget | None = None
     request_text: str | None = None
@@ -1008,6 +1037,17 @@ class _WebSocketRequestState:
     # genuine delta-only client has no other way to convey prior context and
     # must stay anchored.
     proxy_injected_anchor_had_full_resend_payload: bool = False
+    # Process-local denial generation captured before any canonical session
+    # exists. A detached predecessor can reject the anchor while the request
+    # is waiting for owner resolution; retain that generation through retries
+    # so the successor's final dispatch fence still fails closed.
+    denied_proxy_injected_anchor_fence_generation_at_prepare: int | None = None
+    # Generation equality alone cannot distinguish a request captured after a
+    # denial from one captured before it. Preserve the tombstone observation on
+    # the prepared request so a stale durable lookup cannot be redispatched.
+    denied_proxy_injected_anchor_fence_response_id: str | None = None
+    denied_proxy_injected_anchor_fence_request_id: str | None = None
+    denied_proxy_injected_anchor_fence_was_already_denied: bool = False
     expose_stale_previous_response_classifier: bool = False
     fresh_upstream_request_text: str | None = None
     # True only when ``fresh_upstream_request_text`` contains a *safe* pre-
@@ -1019,6 +1059,38 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
+    # Memo for the account installation-id stamp applied to ``request_text`` /
+    # ``fresh_upstream_request_text`` on the HTTP bridge submit path. The stamp
+    # is re-applied at several submit and retry sites; these fields remember the
+    # exact ``str`` objects the last stamp returned for ``codex_installation_id``
+    # so an already-stamped object is recognised by identity instead of being
+    # decoded and re-encoded again. Every text rewrite yields a new ``str``
+    # object and an account swap changes the id, so both miss automatically.
+    installation_stamp_installation_id: str | None = None
+    installation_stamp_text: str | None = None
+    installation_stamp_fresh_text: str | None = None
+    # Set only on the internally constructed one-shot request that replaces an
+    # explicitly rejected stale anchor with a verified full-history payload.
+    # It may bypass an older hard-key retry circuit without deleting that
+    # circuit or weakening admission for ordinary client retries.
+    verified_stale_anchor_replay: bool = False
+    # Snapshot of the hard-key circuit observed when the stale-anchor replay
+    # was authorized. ``captured=True`` with ``generation=None`` proves that no
+    # circuit existed; a newer local/durable failure must suppress submit.
+    verified_stale_anchor_retry_circuit_generation_captured: bool = False
+    verified_stale_anchor_retry_circuit_key: _HTTPBridgeSessionKey | None = None
+    verified_stale_anchor_retry_circuit_generation: tuple[int, float, int, float, int, float, float] | None = None
+    verified_stale_anchor_quarantine_generation: int | None = None
+    # The exact half-open lease this request's admission claimed (0.0 when
+    # it claimed none); released by the submit finalizer whenever the probe
+    # was never dispatched, so no pre-dispatch exit can strand the lease.
+    claimed_half_open_until: float = 0.0
+    # True while the submit owns an admission-waiter registration taken at
+    # submit entry, before the retry-circuit gate, that the dispatch path has
+    # not yet taken over. It keeps the turn visible to a concurrent
+    # cooldown-suppressed sibling deciding whether the shared session is
+    # idle; every pre-dispatch exit releases it.
+    admission_waiter_preregistered: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None
@@ -1049,6 +1121,11 @@ class _WebSocketRequestState:
     # pre-dispatch admission failure may remove that row; an existing row
     # represents an ambiguous upstream attempt and must remain fenced.
     operation_created: bool = False
+    operation_rebound: bool = False
+    operation_rebound_from_session_id: str | None = None
+    operation_rebound_from_account_id: str | None = None
+    operation_rebound_from_model: str | None = None
+    operation_rebound_from_parent_response_id: str | None = None
     operation_replay: bool = False
     operation_dispatched: bool = False
     # Immutable durable attempt generation. Recovery claims increment the
@@ -1076,7 +1153,7 @@ class _WebSocketRequestState:
     error_code_override: str | None = None
     error_message_override: str | None = None
     error_type_override: str | None = None
-    error_param_override: str | None = None
+    error_param_override: OpenAIErrorParam | JsonValue | None = None
     failure_phase_override: str | None = None
     failure_detail_override: str | None = None
     upstream_error_code_override: str | None = None
@@ -1084,11 +1161,22 @@ class _WebSocketRequestState:
     response_event_count: int = 0
     last_upstream_activity_at: float | None = None
     upstream_model_output_seen: bool = False
+    # Terminal WebSocket error sanitization records continuity telemetry once;
+    # later serializers preserve the normalized fields without recording it a
+    # second time.
+    websocket_terminal_error_fields_sanitized: bool = False
     previous_response_not_found_rewritten: bool = False
+    # A canonical stale-anchor code with malformed present ``param`` may be
+    # matched for masking, but must never authorize replay.
+    previous_response_not_found_recovery_blocked: bool = False
     previous_response_owner_lookup_source: str | None = None
     previous_response_owner_lookup_outcome: str | None = None
     previous_response_owner_requested_at: datetime | None = None
     previous_response_owner_session_id: str | None = None
+    # Subscription account proven to own ``previous_response_id`` by the
+    # continuity index/request-log lookup. Identifier syntax is never used as
+    # an ownership signal, so ``None`` leaves configured source routing intact.
+    previous_response_owner_account_id: str | None = None
     response_create_gate_acquired: bool = False
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
@@ -1118,6 +1206,11 @@ class _WebSocketRequestState:
     useragent: str | None = None
     useragent_group: str | None = None
     conversation_id: str | None = None
+    # The Responses payload's own ``conversation``, distinct from the client
+    # log's ``conversation_id`` above. It is account-scoped continuity with no
+    # dedicated owner index, so the raw path cannot prove the bridge session's
+    # owner for it.
+    payload_conversation_bound: bool = False
     client_ip: str | None = None
     downstream_visible: bool = False
     last_downstream_sequence_number: int | None = None
@@ -1128,6 +1221,12 @@ class _WebSocketRequestState:
     deferred_account_error_backoffs: dict[str, Account] = field(default_factory=dict)
     deferred_account_backoff_tracker: _DeferredAccountBackoffTracker | None = None
     deferred_account_backoff_lifecycle: _DeferredAccountBackoffLifecycle | None = None
+    # Classified health writes (mark_rate_limit / mark_quota_exceeded /
+    # record_error) deferred by keyed pre-created retry branches until this
+    # request's API-key reservation settles or its fallback release commits
+    # (settlement-ordering invariant). Entries drop unapplied when neither
+    # confirms.
+    deferred_keyed_stream_health: list[_DeferredKeyedStreamHealthPenalty] = field(default_factory=list)
     deferred_reasoning_downstream_texts: list[str] = field(default_factory=list)
     suppress_next_created_downstream: bool = False
     replay_downstream_response_id: str | None = None
@@ -1192,16 +1291,27 @@ class _HTTPBridgeSession:
     admission_waiter_count: int = 0
     request_service_tier: str | None = None
     catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
-    lifecycle_lock: anyio.Lock = field(default_factory=anyio.Lock)
-    recovery_alias_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    lifecycle_lock: anyio.Lock = field(default_factory=fast_lock)
+    recovery_alias_lock: anyio.Lock = field(default_factory=fast_lock)
     api_key: ApiKeyData | None = None
     codex_session: bool = False
     prewarmed: bool = False
+    access_token_expires_at: float | None = None
     prewarm_lock: anyio.Lock | None = None
     upstream_turn_state: str | None = None
     downstream_turn_state: str | None = None
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     previous_response_ids: set[str] = field(default_factory=set)
+    # The live session keeps only its current denial tombstone.  Historical
+    # ids remain in the process-local fence ledger while prepared requests pin
+    # them, so this carrier cannot grow with every denied sibling anchor.
+    denied_proxy_injected_anchor_ids: set[str] = field(default_factory=set)
+    # Denials whose durable or local alias cleanup still needs a retry.  This
+    # is separate from the current tombstone carrier: a sibling-advanced
+    # denial remains fenced for pinned requests, but is not unresolved cleanup
+    # and may be retired when the session closes.
+    denied_proxy_injected_anchor_cleanup_pending: set[str] = field(default_factory=set)
+    denied_proxy_injected_anchor_generation: int = 0
     alias_registration_generation: int = 0
     turn_state_alias_registration_generations: dict[str, int] = field(default_factory=dict)
     previous_response_alias_registration_generations: dict[str, int] = field(default_factory=dict)
@@ -1218,6 +1328,7 @@ class _HTTPBridgeSession:
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
+    last_upstream_event_generation: int = 0
     last_upstream_close_code: int | None = None
     last_upstream_close_generation: int = 0
     closed: bool = False
@@ -1250,6 +1361,24 @@ class _HTTPBridgeSession:
     upstream_proxy_endpoint_id: str | None = None
     upstream_proxy_fallback_used: bool | None = None
     upstream_proxy_fail_closed_reason: str | None = None
+    # Upstream frames that proved transport liveness but matched no pending
+    # request. They are dropped from the downstream queues, so without this
+    # counter a pre-response bridge timeout cannot tell "upstream said nothing"
+    # apart from "upstream spoke and our matching lost the frame".
+    unmatched_upstream_liveness_count: int = 0
+
+    def replace_connection(
+        self,
+        account: Account,
+        headers: dict[str, str],
+        upstream: UpstreamWebSocket,
+        access_token_expires_at: float | None,
+    ) -> None:
+        """Replace account-bound transport state as one in-memory operation."""
+        self.account = account
+        self.headers = headers
+        self.upstream = upstream
+        self.access_token_expires_at = access_token_expires_at
 
     def claim_liveness_settlement(self) -> bool:
         """Claim whole-deque settlement for a liveness-failed submitter.
@@ -1476,6 +1605,8 @@ def _mark_response_create_attempt_observed(
     attempt = request_state.response_create_attempt
     if attempt is not None:
         attempt.response_observed = True
+        if event_type not in {"response.failed", "response.incomplete"}:
+            attempt.non_terminal_response_observed = True
 
 
 def _record_response_event(request_state: _WebSocketRequestState | None, event_type: str | None) -> None:
@@ -1726,9 +1857,9 @@ def _openai_error_envelope_from_response_failed_payload(
     error_type = type_value.strip() if isinstance(type_value, str) and type_value.strip() else "server_error"
 
     envelope = openai_error(code, message, error_type)
-    param_value = error_payload.get("param")
-    if isinstance(param_value, str) and param_value.strip():
-        envelope["error"]["param"] = param_value.strip()
+    if "param" in error_payload:
+        param_state = OpenAIErrorParam.from_mapping(cast(Mapping[str, JsonValue], error_payload))
+        envelope["error"]["param"] = param_state.raw
     error_detail = envelope["error"]
     plan_type = error_payload.get("plan_type")
     if plan_type is not None:
@@ -1740,3 +1871,61 @@ def _openai_error_envelope_from_response_failed_payload(
     if isinstance(resets_in, int | float):
         error_detail["resets_in_seconds"] = resets_in
     return envelope
+
+
+# --- Upstream websocket transport health -----------------------------------
+#
+# Codex clients only switch to the HTTP transport when the websocket
+# handshake is rejected with HTTP 426 (codex-rs checks
+# ``StatusCode::UPGRADE_REQUIRED`` on connect; in-band error events never
+# trigger the transport fallback). This per-instance marker remembers a
+# recent connect-phase upstream websocket transport failure so the websocket
+# routes can deny the next handshake with 426 and the HTTP paths can pin the
+# upstream transport to HTTP until the websocket upstream proves healthy
+# again.
+
+UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS = 60.0
+_upstream_ws_transport_failure_at: float | None = None
+
+
+def mark_upstream_websocket_transport_failure() -> None:
+    global _upstream_ws_transport_failure_at
+    _upstream_ws_transport_failure_at = time.monotonic()
+
+
+def clear_upstream_websocket_transport_failure() -> None:
+    global _upstream_ws_transport_failure_at
+    _upstream_ws_transport_failure_at = None
+
+
+def websocket_connect_transport_failure_code(
+    exc: ProxyResponseError,
+    *,
+    confirmed_pre_dispatch: bool,
+) -> str | None:
+    """Code of a host-scoped upstream websocket transport failure, else ``None``.
+
+    The discriminator is the provenance the direct upstream open stamps, not
+    the sanitized error code. Codes cannot carry it in either direction: the
+    responses policy preserves the upstream handshake body, so a direct 5xx
+    upgrade rejection surfaces as ``upstream_error`` or whatever the edge
+    returned, while OAuth refresh transport errors, routed-proxy handshakes,
+    TLS verification failures and host-wide network loss all share the
+    ``upstream_unavailable`` envelope and must keep their
+    classify-penalize-failover handling.
+    """
+
+    if confirmed_pre_dispatch or exc.failure_phase != "connect":
+        return None
+    if exc.failure_detail != UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL:
+        return None
+    connect_error = _parse_openai_error(exc.payload)
+    return _normalize_error_code(
+        connect_error.code if connect_error else None,
+        connect_error.type if connect_error else None,
+    )
+
+
+def upstream_websocket_transport_recently_failed() -> bool:
+    marked_at = _upstream_ws_transport_failure_at
+    return marked_at is not None and time.monotonic() - marked_at < UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS

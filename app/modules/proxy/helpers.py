@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Iterable
+import re
+from collections.abc import Mapping
+from typing import Iterable, cast
 
 from pydantic import ValidationError
 
 from app.core import usage as usage_core
 from app.core.balancer.types import ClassifiedFailure, FailureClass, FailurePhase, UpstreamError
-from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope
+from app.core.errors import OpenAIErrorDetail, OpenAIErrorParam
 from app.core.openai.models import OpenAIError
 from app.core.plan_types import normalize_rate_limit_plan_type
 from app.core.types import JsonValue
@@ -40,6 +42,29 @@ _TRANSIENT_CODES = frozenset(
     {"server_error", "upstream_error", "stream_incomplete", "overloaded_error", "server_is_overloaded"}
 )
 _MODEL_CAPACITY_MESSAGE_MARKERS = ("selected model is at capacity",)
+_MODEL_UNSUPPORTED_MESSAGE_RE = re.compile(
+    r"^The '.+' model is not supported when using Codex with a ChatGPT account\.$"
+)
+
+
+def is_model_scoped_upstream_rejection(message: str | None) -> bool:
+    """Match the ChatGPT model-entitlement rejection for *any* requested model.
+
+    The rejection names the model, not the account: it reproduces on every
+    request for that model and says nothing about whether the serving account
+    can still stream the models it is entitled to. Callers use it to keep the
+    rejection out of account health while leaving failover alone -- a different
+    account may hold a different entitlement.
+
+    Unlike ``_is_account_model_unsupported_error`` this does not require the
+    caller to know the requested model or the normalized error code. Upstream
+    delivers this rejection over the Codex WebSocket with neither ``code`` nor
+    ``type`` populated, which normalizes to the ``upstream_error`` fallback, so
+    a code-gated match misses it on the live stream path.
+    """
+    if message is None:
+        return False
+    return _MODEL_UNSUPPORTED_MESSAGE_RE.fullmatch(" ".join(message.split())) is not None
 
 
 def _is_account_model_unsupported_error(
@@ -101,11 +126,7 @@ def _header_account_id(account_id: str | None) -> str | None:
 
 
 def _select_accounts_for_limits(accounts: Iterable[Account]) -> list[Account]:
-    return [
-        account
-        for account in accounts
-        if account.status not in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
-    ]
+    return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
 
 
 def _summarize_window(
@@ -289,24 +310,30 @@ def _normalize_error_code(code: str | None, error_type: str | None) -> str:
     return value.lower()
 
 
-def _parse_openai_error(payload: OpenAIErrorEnvelope) -> OpenAIError | None:
+def _parse_openai_error(payload: Mapping[str, object]) -> OpenAIError | None:
     error = payload.get("error")
-    if not error:
+    if not isinstance(error, Mapping) or not error:
         return None
+    error_mapping = cast(Mapping[str, JsonValue], error)
+    param_state = OpenAIErrorParam.from_mapping(error_mapping)
     try:
-        return OpenAIError.model_validate(error)
+        parsed = OpenAIError.model_validate(error_mapping)
     except ValidationError:
-        if not isinstance(error, dict):
-            return None
-        return OpenAIError(
-            message=_coerce_str(error.get("message")),
-            type=_coerce_str(error.get("type")),
-            code=_coerce_str(error.get("code")),
-            param=_coerce_str(error.get("param")),
-            plan_type=_coerce_str(error.get("plan_type")),
-            resets_at=_coerce_number(error.get("resets_at")),
-            resets_in_seconds=_coerce_number(error.get("resets_in_seconds")),
+        parsed = OpenAIError(
+            message=_coerce_str(error_mapping.get("message")),
+            type=_coerce_str(error_mapping.get("type")),
+            code=_coerce_str(error_mapping.get("code")),
+            param=_coerce_str(error_mapping.get("param")),
+            plan_type=_coerce_str(error_mapping.get("plan_type")),
+            resets_at=_coerce_number(error_mapping.get("resets_at")),
+            resets_in_seconds=_coerce_number(error_mapping.get("resets_in_seconds")),
         )
+    parsed.set_param_state(param_state)
+    return parsed
+
+
+def _openai_error_param(error: OpenAIError | None) -> OpenAIErrorParam:
+    return error.param_state if error is not None else OpenAIErrorParam.absent()
 
 
 def _coerce_str(value: JsonValue) -> str | None:

@@ -23,12 +23,16 @@ PERMANENT_FAILURE_CODES = {
     # ``token_expired`` from the OAuth refresh endpoint means the refresh
     # request itself failed because the refresh token (or the session it
     # belonged to) is no longer usable -- access-token-only expiry would have
-    # returned a fresh token pair instead. Treat it as a permanent failure so
-    # the account stops being routed to until it is re-authenticated.
+    # returned a fresh token pair instead. Treat it as a permanent refresh
+    # failure while ordinary requests may continue with the stored access token.
     "token_expired": "Authentication token expired - re-login required",
     "app_session_terminated": "ChatGPT session ended - re-login required",
     "account_session_expired": "ChatGPT session ended - re-login required",
     "account_auth_invalidated": "Authentication failed after token refresh - re-login required",
+    # The OAuth endpoint uses this code for an invalid/revoked refresh token.
+    # Keep it in the permanent set so the account is surfaced for re-auth
+    # instead of remaining active while every request retries the dead token.
+    "invalid_refresh_token": "Refresh token invalid - re-login required",
     "account_deactivated": "Account has been deactivated",
     "account_suspended": "Account has been suspended",
     "account_deleted": "Account has been deleted",
@@ -45,6 +49,7 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
         "app_session_terminated",
         "account_session_expired",
         "account_auth_invalidated",
+        "invalid_refresh_token",
     }
 )
 
@@ -135,6 +140,7 @@ class AccountState:
     priority_reset_at: int | None = None
     priority_capacity_credits: float | None = None
     limit_scoped_usage: bool = False
+    access_token_expires_at: float | None = None
     inflight_response_creates: int = 0
     inflight_streams: int = 0
     leased_tokens: float = 0.0
@@ -209,7 +215,6 @@ def pool_usage_exhaustion(
         and state.status
         not in (
             AccountStatus.PAUSED,
-            AccountStatus.REAUTH_REQUIRED,
             AccountStatus.DEACTIVATED,
         )
     ]
@@ -359,7 +364,7 @@ def _has_other_usable_foreground_capacity(
     for other in available:
         if other.account_id == candidate.account_id:
             continue
-        if other.status != AccountStatus.ACTIVE:
+        if other.status not in (AccountStatus.ACTIVE, AccountStatus.REAUTH_REQUIRED):
             continue
         if _routing_policy(other) == ROUTING_POLICY_PRESERVE:
             if _preserve_allows_opportunistic_burn(other, current, preserve_count=preserve_count):
@@ -441,6 +446,15 @@ def _fallback_secondary_capacity_credits(plan_type: str | None) -> float:
     return PLAN_CAPACITY_CREDITS_SECONDARY.get(
         resolved_plan,
         PLAN_CAPACITY_CREDITS_SECONDARY[UNKNOWN_PLAN_FALLBACK],
+    )
+
+
+def _known_expired_reauth(state: AccountState, current: float) -> bool:
+    """Return whether a warning-state account has crossed known token expiry."""
+    return (
+        state.status == AccountStatus.REAUTH_REQUIRED
+        and state.access_token_expires_at is not None
+        and state.access_token_expires_at <= current
     )
 
 
@@ -543,9 +557,11 @@ def select_account(
             or bypass_quota_exceeded
             or (bypass_account_ids is not None and state.account_id in bypass_account_ids)
         )
-        if state.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+        if state.status == AccountStatus.DEACTIVATED:
             continue
         if state.status == AccountStatus.PAUSED:
+            continue
+        if _known_expired_reauth(state, current):
             continue
         if state.status == AccountStatus.RATE_LIMITED:
             if state.reset_at and current >= state.reset_at:
@@ -593,13 +609,15 @@ def select_account(
     if not available:
         in_error_backoff_ids = {state.account_id for state in in_error_backoff}
         hard_blocked_exists = any(
-            state.status
-            in (
-                AccountStatus.PAUSED,
-                AccountStatus.REAUTH_REQUIRED,
-                AccountStatus.DEACTIVATED,
-                AccountStatus.RATE_LIMITED,
-                AccountStatus.QUOTA_EXCEEDED,
+            (
+                state.status
+                in (
+                    AccountStatus.PAUSED,
+                    AccountStatus.DEACTIVATED,
+                    AccountStatus.RATE_LIMITED,
+                    AccountStatus.QUOTA_EXCEEDED,
+                )
+                or _known_expired_reauth(state, current)
             )
             and state.account_id not in in_error_backoff_ids
             for state in all_states
@@ -626,24 +644,24 @@ def select_account(
                 )
                 if usage_exhaustion is not None:
                     return usage_exhaustion
-            reauth_required = [s for s in all_states if s.status == AccountStatus.REAUTH_REQUIRED]
+            expired_reauth = [state for state in all_states if _known_expired_reauth(state, current)]
             deactivated = [s for s in all_states if s.status == AccountStatus.DEACTIVATED]
             paused = [s for s in all_states if s.status == AccountStatus.PAUSED]
             rate_limited = [s for s in all_states if s.status == AccountStatus.RATE_LIMITED]
             quota_exceeded = [s for s in all_states if s.status == AccountStatus.QUOTA_EXCEEDED]
 
             if not rate_limited and not quota_exceeded:
-                if paused and reauth_required and deactivated:
+                if paused and expired_reauth and deactivated:
                     return SelectionResult(None, "All accounts are paused, deactivated, or require re-authentication")
-                if paused and reauth_required:
+                if paused and expired_reauth:
                     return SelectionResult(None, "All accounts are paused or require re-authentication")
                 if paused and deactivated:
                     return SelectionResult(None, "All accounts are paused or deactivated")
-                if reauth_required and deactivated:
+                if expired_reauth and deactivated:
                     return SelectionResult(None, "All accounts are deactivated or require re-authentication")
                 if paused:
                     return SelectionResult(None, "All accounts are paused")
-                if reauth_required:
+                if expired_reauth:
                     return SelectionResult(None, "All accounts require re-authentication")
                 if deactivated:
                     return SelectionResult(None, "All accounts are deactivated")
@@ -1368,7 +1386,6 @@ def evaluate_health_tier(
         AccountStatus.RATE_LIMITED,
         AccountStatus.QUOTA_EXCEEDED,
         AccountStatus.PAUSED,
-        AccountStatus.REAUTH_REQUIRED,
         AccountStatus.DEACTIVATED,
     ):
         return state.health_tier

@@ -18,6 +18,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
+    _agent_control_tool_output_occurrences,
     _as_image_fetch_session,
     _inline_content_images,
     _inline_input_image_urls,
@@ -37,17 +38,24 @@ from app.core.clients.proxy_websocket import (
     UpstreamWebSocket,
 )
 from app.core.errors import (
+    PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
+    PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    SYNTHETIC_TRANSPORT_FAILURE_CODES,
+    OpenAIErrorParam,
+    openai_error,
+    response_failed_event,
+    synthetic_stream_failure_event,
+    synthetic_transport_failure_event,
+)
+from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_CODE as PREVIOUS_RESPONSE_NOT_FOUND_CODE,
 )
 from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE as PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
 )
-from app.core.errors import (
-    PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
-    response_failed_event,
-)
-from app.core.openai.models import OpenAIEvent
-from app.core.openai.parsing import parse_sse_event
+from app.core.openai.models import OpenAIError, OpenAIEvent, OpenAIResponsePayload, ResponseUsage
+from app.core.openai.parsing import classify_event_type, parse_sse_event
+from app.core.openai.requests import ResponsesRequest
 from app.core.resilience.network_recovery import (
     PROCESS_NETWORK_UNAVAILABLE_CODE,
 )
@@ -387,6 +395,7 @@ from app.modules.proxy.durable_bridge_coordinator import (
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     classify_upstream_failure,
+    is_model_scoped_upstream_rejection,
     is_upstream_model_capacity_error,
 )
 from app.modules.proxy.http_bridge_forwarding import (
@@ -400,6 +409,70 @@ from app.modules.proxy.load_balancer import AccountSelection
 
 def _facade() -> Any:
     return sys.modules["app.modules.proxy.service"]
+
+
+def _canonical_background_ack(
+    event_payload: dict[str, JsonValue] | None,
+    event_type: str | None,
+) -> tuple[str, OpenAIResponsePayload] | None:
+    if event_type not in {"response.queued", "response.in_progress"}:
+        return None
+    response = event_payload.get("response") if event_payload is not None else None
+    response_id = response.get("id") if isinstance(response, dict) else None
+    if not (
+        isinstance(response, dict)
+        and response.get("object") == "response"
+        and isinstance(response_id, str)
+        and bool(response_id)
+        and response_id == response_id.strip()
+        and response.get("status") == event_type.removeprefix("response.")
+        and response.get("output") == []
+    ):
+        return None
+    # The relayed payload model drops known submodels that fail validation
+    # instead of raising, so a malformed `usage` or `error` would otherwise be
+    # discarded silently on a response classified as successful.
+    payload = OpenAIResponsePayload.model_validate(response)
+    if (response.get("usage") is None) != (payload.usage is None):
+        return None
+    if (response.get("error") is None) != (payload.error is None):
+        return None
+    return response_id, payload
+
+
+def _canonical_background_ack_response_id(
+    event_payload: dict[str, JsonValue] | None,
+    event_type: str | None,
+) -> str | None:
+    canonical_ack = _canonical_background_ack(event_payload, event_type)
+    return canonical_ack[0] if canonical_ack is not None else None
+
+
+def _is_background_json_ack(
+    stream: bool | None,
+    event_payload: dict[str, JsonValue] | None,
+    event_type: str | None,
+) -> bool:
+    return stream is False and _canonical_background_ack_response_id(event_payload, event_type) is not None
+
+
+def _settle_background_ack(
+    settlement: _StreamSettlement,
+    payload: ResponsesRequest,
+    event_payload: dict[str, JsonValue] | None,
+    response_id: str,
+) -> tuple[bool, str, ResponseUsage | None]:
+    """Treat a canonical background acknowledgement as the terminal event of a `stream: false` request."""
+    canonical_ack = (
+        _canonical_background_ack(event_payload, classify_event_type(event_payload))
+        if payload.stream is False
+        else None
+    )
+    if canonical_ack is None:
+        return False, response_id, None
+    ack_response_id, ack_payload = canonical_ack
+    settlement.response_id = ack_response_id
+    return True, ack_response_id, ack_payload.usage
 
 
 def _stream_iterator_after_capacity_admission(
@@ -517,7 +590,7 @@ def _rewrite_previous_response_stream_error(
     error_code: str | None,
     error_type: str | None,
     error_message: str | None,
-    error_param: str | None,
+    error_param: OpenAIErrorParam | JsonValue,
 ) -> tuple[str, str, str | None] | None:
     if previous_response_id is None:
         return None
@@ -553,6 +626,25 @@ def _rewrite_previous_response_stream_error(
             PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
             None,
         )
+    if _facade()._is_previous_response_not_found_public_shape(
+        code=error_code,
+        param=error_param,
+        message=error_message,
+    ):
+        # Preserve masking when malformed ``param`` metadata makes the
+        # recovery classifier fail closed. This branch never authorizes
+        # replay or account switching.
+        _record_continuity_fail_closed(
+            surface="http_stream",
+            reason=PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
+            previous_response_id=previous_response_id,
+            upstream_error_code=error_code,
+        )
+        return (
+            "stream_incomplete",
+            PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+            None,
+        )
     normalized_code = _normalize_error_code(error_code, error_type)
     if preferred_account_id is not None and normalized_code in _facade()._ACCOUNT_RECOVERY_RETRY_CODES:
         _record_continuity_fail_closed(
@@ -572,7 +664,7 @@ def _rewrite_previous_response_stream_error(
 def _raw_stream_error_fields(
     event_type: str | None,
     event_payload: dict[str, JsonValue] | None,
-) -> tuple[str | None, str | None, str | None, str]:
+) -> tuple[str | None, str | None, OpenAIErrorParam | None, str]:
     raw_error_type = _websocket_event_error_type(event_type, event_payload)
     raw_error_message = _websocket_event_error_message(event_type, event_payload)
     raw_error_param = _websocket_event_error_param(event_type, event_payload)
@@ -582,6 +674,14 @@ def _raw_stream_error_fields(
         raw_error_param,
         _normalize_error_code(_websocket_event_error_code(event_type, event_payload), raw_error_type),
     )
+
+
+def _openai_error_fields(
+    error: OpenAIError | None,
+) -> tuple[str | None, str | None, OpenAIErrorParam | None]:
+    if error is None:
+        return None, None, None
+    return error.type, error.message, error.param_state
 
 
 def _raw_stream_error_code_or_upstream(
@@ -689,11 +789,29 @@ def _build_rewritten_stream_response_failed_event(
         error_type="server_error",
         response_id=response_id,
     )
+    if error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES:
+        rewritten_event_payload = synthetic_transport_failure_event(rewritten_event_payload)
     rewritten_event_block = format_sse_event(rewritten_event_payload)
     rewritten_payload = parse_sse_data_json(rewritten_event_block)
     rewritten_event = parse_sse_event(rewritten_event_block)
     rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
     return rewritten_event_block, rewritten_event, rewritten_payload, rewritten_event_type
+
+
+def _stream_transport_failure_event_or_raise(
+    error_code: str,
+    error_message: str,
+    *,
+    response_id: str,
+    preserve_native_failure_lifecycle: bool,
+) -> str:
+    if preserve_native_failure_lifecycle:
+        raise ProxyResponseError(
+            502,
+            openai_error(error_code, error_message),
+            failure_phase="upstream",
+        )
+    return format_sse_event(synthetic_stream_failure_event(error_code, error_message, response_id=response_id))
 
 
 def _build_stream_incomplete_terminal_event_for_request(
@@ -710,16 +828,10 @@ def _build_stream_incomplete_terminal_event_for_request(
         error_code=error_code,
         error_message=error_message,
     )
+    if payload is None:  # pragma: no cover - formatter/parser contract
+        raise RuntimeError("rewritten stream failure event did not contain a JSON payload")
     downstream_text = json.dumps(
-        cast(
-            dict[str, JsonValue],
-            response_failed_event(
-                error_code,
-                error_message,
-                error_type="server_error",
-                response_id=_websocket_downstream_response_id(request_state),
-            ),
-        ),
+        payload,
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -730,6 +842,7 @@ def _slim_response_create_payload_for_upstream(
     payload: dict[str, JsonValue],
     *,
     max_bytes: int,
+    protected_agent_control_output_occurrences: Mapping[tuple[str, str], tuple[bool, ...]] | None = None,
 ) -> tuple[dict[str, JsonValue], dict[str, int] | None]:
     input_value = payload.get("input")
     if not isinstance(input_value, list) or not input_value:
@@ -742,6 +855,9 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
+    if protected_agent_control_output_occurrences is None:
+        protected_agent_control_output_occurrences = _agent_control_tool_output_occurrences(historical)
+    agent_control_output_counts: dict[tuple[str, str], int] = {}
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -749,7 +865,11 @@ def _slim_response_create_payload_for_upstream(
             slimmed_item,
             item_tool_outputs_slimmed,
             item_images_slimmed,
-        ) = _facade()._slim_historical_response_input_item(item)
+        ) = _facade()._slim_historical_response_input_item(
+            item,
+            protected_agent_control_output_occurrences=protected_agent_control_output_occurrences,
+            agent_control_output_counts=agent_control_output_counts,
+        )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
         slimmed_historical.append(slimmed_item)
@@ -822,6 +942,7 @@ async def _select_account_with_budget_for_stream(proxy: Any, deadline: float, **
         "estimated_lease_tokens",
         "fallback_on_preferred_account_unavailable",
         "preferred_account_is_continuity_owner",
+        "preferred_account_overrides_single_account_routing",
         "spill_bare_session_on_account_cap",
         "require_unambiguous_account",
     )
@@ -854,17 +975,48 @@ def _is_account_neutral_request_rejection(
     on a self-inconsistent conversation drives its serving accounts into
     ``error_count`` backoff and starves unrelated tenants.
 
-    Keep this set narrow. Not every upstream ``invalid_request_error`` is
-    account neutral -- the model-entitlement rejection matched by
-    ``_is_account_model_unsupported_error`` is genuinely account scoped -- so
-    membership is decided by the specific classified message, never by the
-    ``invalid_request_error`` code alone.
+    Keep this set narrow: membership is decided by the specific classified
+    message, never by the ``invalid_request_error`` code alone. The
+    model-entitlement rejection is deliberately not a member -- it is handled
+    by ``_is_model_scoped_rejection`` below, which likewise keeps the account's
+    health untouched but still lets failover try accounts whose entitlements
+    may differ.
     """
     if code != "invalid_request_error":
         return False
     if http_status is not None and http_status != 400:
         return False
     return bool(_facade()._is_missing_tool_output_message(message))
+
+
+def _is_model_scoped_rejection(
+    *,
+    http_status: int | None,
+    message: str | None,
+) -> bool:
+    """Return whether upstream rejected the requested model, not the account.
+
+    The ChatGPT model-entitlement rejection is scoped to the model named in the
+    message. It proves nothing about the account's ability to serve the models
+    it *is* entitled to, so it must never move that account's ``error_count``:
+    otherwise one client looping on a model no account can serve drives every
+    serving account into ``ERROR_BACKOFF_THRESHOLD`` backoff and starves all
+    unrelated traffic on those accounts -- the exact failure mode when a model
+    reaches subscription selection because its OpenAI-compatible model source
+    is disabled or unreachable.
+
+    Failover is deliberately untouched: the classified failure is still
+    returned, so the caller keeps trying other accounts, whose entitlements may
+    differ.
+
+    The normalized code is not part of the match. Upstream delivers this
+    rejection with neither ``code`` nor ``type`` on the streaming path, which
+    normalizes to ``upstream_error``; on other paths it arrives as
+    ``invalid_request_error``. Only the exact message shape decides membership.
+    """
+    if http_status is not None and http_status != 400:
+        return False
+    return is_model_scoped_upstream_rejection(message)
 
 
 async def _handle_stream_error(
@@ -891,6 +1043,17 @@ async def _handle_stream_error(
     ):
         _facade().logger.info(
             "Skipped account error penalty for account-neutral request rejection account_id=%s request_id=%s code=%s",
+            "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
+            get_request_id(),
+            code,
+        )
+        return classified
+    if _is_model_scoped_rejection(
+        http_status=http_status,
+        message=error.get("message"),
+    ):
+        _facade().logger.info(
+            "Skipped account error penalty for model-scoped upstream rejection account_id=%s request_id=%s code=%s",
             "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
             get_request_id(),
             code,
