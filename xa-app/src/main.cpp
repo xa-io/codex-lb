@@ -864,12 +864,18 @@ int RunWindowedApplication() {
         return 1;
     }
 
-    RECT desired{0, 0, 1280, 840};
-    AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
-    const int width = desired.right - desired.left;
-    const int height = desired.bottom - desired.top;
-    const int x = std::max(0, (GetSystemMetrics(SM_CXSCREEN) - width) / 2);
-    const int y = std::max(0, (GetSystemMetrics(SM_CYSCREEN) - height) / 2);
+    // Leave room around the dashboard's 1500 CSS-pixel page at the current scaling.
+    const UINT dpi = GetDpiForSystem();
+    RECT desired{0, 0, MulDiv(1525, static_cast<int>(dpi), 96), 840};
+    AdjustWindowRectExForDpi(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    RECT workArea{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int availableWidth = workArea.right - workArea.left;
+    const int availableHeight = workArea.bottom - workArea.top;
+    const int width = std::min(static_cast<int>(desired.right - desired.left), availableWidth);
+    const int height = std::min(static_cast<int>(desired.bottom - desired.top), availableHeight);
+    const int x = workArea.left + (availableWidth - width) / 2;
+    const int y = workArea.top + (availableHeight - height) / 2;
     g_app.window = CreateWindowExW(
         0,
         kWindowClass,

@@ -33,6 +33,31 @@ def _make_account(account_id: str, email: str) -> Account:
 
 
 @pytest.mark.asyncio
+async def test_usage_summary_includes_persisted_astra_priority_cost(db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        logs_repo = RequestLogsRepository(session)
+        service = UsageService(UsageRepository(session), logs_repo, accounts_repo)
+        await accounts_repo.upsert(_make_account("astra", "astra@example.com"))
+        saved = await logs_repo.add_log(
+            account_id="astra",
+            request_id="astra_priority_cost",
+            model="gpt-6-astra",
+            input_tokens=300_000,
+            cached_input_tokens=200_000,
+            output_tokens=10_000,
+            service_tier="priority",
+            latency_ms=100,
+            status="success",
+            error_code=None,
+            requested_at=utcnow() - timedelta(minutes=1),
+        )
+        assert saved.cost_usd == pytest.approx(6.3)
+        summary = await service.get_usage_summary()
+        assert summary.cost.total_usd_7d == pytest.approx(6.3)
+
+
+@pytest.mark.asyncio
 async def test_usage_summary_cost_includes_cached_tokens(db_setup):
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)

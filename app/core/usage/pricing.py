@@ -25,6 +25,9 @@ class ModelPrice:
     long_context_input_per_1m: float | None = None
     long_context_output_per_1m: float | None = None
     long_context_cached_input_per_1m: float | None = None
+    priority_long_context_input_per_1m: float | None = None
+    priority_long_context_output_per_1m: float | None = None
+    priority_long_context_cached_input_per_1m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,26 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
 
 
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
+    # https://developers.openai.com/api/docs/models/gpt-6-astra (2026-09-06).
+    # Cache writes are not separately represented in UsageTokens.
+    "gpt-6-astra": ModelPrice(
+        input_per_1m=10.0,
+        cached_input_per_1m=1.0,
+        output_per_1m=50.0,
+        priority_input_per_1m=20.0,
+        priority_cached_input_per_1m=2.0,
+        priority_output_per_1m=100.0,
+        flex_input_per_1m=5.0,
+        flex_cached_input_per_1m=0.5,
+        flex_output_per_1m=25.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=20.0,
+        long_context_cached_input_per_1m=2.0,
+        long_context_output_per_1m=75.0,
+        priority_long_context_input_per_1m=40.0,
+        priority_long_context_cached_input_per_1m=4.0,
+        priority_long_context_output_per_1m=150.0,
+    ),
     "gpt-5.6-sol": ModelPrice(
         input_per_1m=5.0,
         cached_input_per_1m=0.5,
@@ -323,6 +346,7 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-6-astra-*": "gpt-6-astra",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-5.6-sol*": "gpt-5.6-sol",
     "gpt-5.6-terra*": "gpt-5.6-terra",
@@ -429,6 +453,17 @@ def _effective_rates(
     output_rate = price.output_per_1m
 
     if _uses_priority_tier(service_tier):
+        if (
+            is_long_context
+            and price.priority_long_context_input_per_1m is not None
+            and price.priority_long_context_output_per_1m is not None
+        ):
+            priority_cached = (
+                price.priority_long_context_cached_input_per_1m
+                if price.priority_long_context_cached_input_per_1m is not None
+                else price.priority_long_context_input_per_1m
+            )
+            return price.priority_long_context_input_per_1m, priority_cached, price.priority_long_context_output_per_1m
         if price.priority_input_per_1m is not None and price.priority_output_per_1m is not None:
             priority_cached = (
                 price.priority_cached_input_per_1m

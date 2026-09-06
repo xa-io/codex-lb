@@ -19,6 +19,31 @@ from app.core.usage.pricing import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("model", ["gpt-6-astra", "GPT-6-ASTRA", "gpt-6-astra-2026-09-03"])
+def test_astra_alias_cost_is_included_in_summary(model: str) -> None:
+    summary = calculate_costs([CostItem(model=model, usage=UsageTokens(200_000, 10_000, 100_000))])
+    assert summary.total_usd_7d == pytest.approx(1.6)
+    assert len(summary.by_model) == 1
+    assert summary.by_model[0].model == "gpt-6-astra"
+    assert summary.by_model[0].usd == pytest.approx(1.6)
+
+
+@pytest.mark.parametrize("tier,multiplier", [(None, 1), ("default", 1), ("flex", 0.5), ("priority", 2), ("fast", 2)])
+@pytest.mark.parametrize(
+    "input_tokens,expected",
+    [(272_000, 2.32), (272_001, 4.39002), (300_000, 4.95)],
+)
+def test_astra_cost_context_boundary_and_tiers(
+    tier: str | None, multiplier: float, input_tokens: int, expected: float
+) -> None:
+    resolved = get_pricing_for_model("gpt-6-astra")
+    assert resolved is not None
+    _, price = resolved
+    # 100K cached input and 10K output; the threshold includes cached input.
+    cost = calculate_cost_from_usage(UsageTokens(input_tokens, 10_000, 100_000), price, service_tier=tier)
+    assert cost == pytest.approx(expected * multiplier)
+
+
 def test_resolve_model_alias_longest_match():
     aliases = {
         "gpt-5*": "gpt-5",
