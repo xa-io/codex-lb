@@ -3,7 +3,9 @@
 ## Purpose
 
 Define dashboard surface contracts so settings, account management, and operational views stay coherent across the SPA.
+
 ## Requirements
+
 ### Requirement: Settings page
 
 The Settings page SHALL include sections for: routing settings (sticky threads,
@@ -3348,3 +3350,29 @@ The x-axis tick format of the Account Trend and API Trend charts SHALL be `MM-DD
 - **WHEN** the API Trend chart renders with timestamp data
 - **THEN** the x-axis tick labels SHALL be in `MM-DD` format (e.g., `"08-09"`)
 
+### Requirement: Dashboard desktop summaries occupy one row above accounts and credits
+
+At viewport widths of at least 1280 CSS pixels, the dashboard SHALL render all visible summary cards in one equal-width row. Smaller viewports SHALL retain responsive wrapping. The Accounts section SHALL follow the summary cards and precede the 5-Hour Credits, Weekly Credits, and optional weekly credits pace cards. This order SHALL apply to both account view modes. The loading skeleton SHALL reflect the visible summary count and the same section order.
+
+#### Scenario: All six summary cards fit the desktop row
+
+- **WHEN** the dashboard renders at a 1500 CSS pixel viewport with account burn projection enabled
+- **THEN** Requests, Tokens, Est. API Cost, Active Conversations, Account Burn Projection, and Error Rate appear in one row
+- **AND** Accounts appears above the credit cards in both list and card modes
+
+#### Scenario: Hiding account burn projection keeps one row
+
+- **WHEN** account burn projection is disabled at a desktop viewport
+- **THEN** the remaining five summary cards occupy one equal-width row
+
+#### Scenario: Narrow screens remain usable
+
+- **WHEN** the dashboard renders at a 390 CSS pixel viewport
+- **THEN** summary cards wrap without widening the document
+- **AND** Accounts remains before the credit cards
+
+#### Scenario: Loading preserves the dashboard hierarchy
+
+- **WHEN** the dashboard overview is loading
+- **THEN** the skeleton reserves five or six summary cards according to the account burn projection preference
+- **AND** account placeholders appear before credit placeholders

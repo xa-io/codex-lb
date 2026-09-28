@@ -464,6 +464,28 @@ export function DashboardPage() {
         <>
           <StatsGrid stats={view.stats} />
 
+          <section className="space-y-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-3">
+                <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">{t("accounts.page.title")}</h2>
+                <AccountSummaryLine accounts={overview?.accounts ?? []} />
+              </div>
+              <div className="h-px min-w-8 flex-1 bg-border" />
+              <AccountViewModeToggle value={accountViewMode} onChange={setAccountViewMode} />
+            </div>
+            {accountViewMode === "list" ? (
+              <AccountList
+                accounts={overview?.accounts ?? []}
+                readOnly={!canWrite}
+                sort={accountListSort}
+                onSortChange={setAccountListSort}
+                onAction={handleAccountAction}
+              />
+            ) : (
+              <AccountCards accounts={overview?.accounts ?? []} readOnly={!canWrite} onAction={handleAccountAction} />
+            )}
+          </section>
+
           {view.weeklyCreditPace ? (
             <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
               <UsageDonuts
@@ -490,28 +512,6 @@ export function DashboardPage() {
               safeLineSecondary={view.safeLineSecondary}
             />
           )}
-
-          <section className="space-y-4">
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex min-w-0 flex-wrap items-center gap-3">
-                <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">{t("accounts.page.title")}</h2>
-                <AccountSummaryLine accounts={overview?.accounts ?? []} />
-              </div>
-              <div className="h-px min-w-8 flex-1 bg-border" />
-              <AccountViewModeToggle value={accountViewMode} onChange={setAccountViewMode} />
-            </div>
-            {accountViewMode === "list" ? (
-              <AccountList
-                accounts={overview?.accounts ?? []}
-                readOnly={!canWrite}
-                sort={accountListSort}
-                onSortChange={setAccountListSort}
-                onAction={handleAccountAction}
-              />
-            ) : (
-              <AccountCards accounts={overview?.accounts ?? []} readOnly={!canWrite} onAction={handleAccountAction} />
-            )}
-          </section>
 
           <section className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">

@@ -29,27 +29,25 @@ export type StatsGridProps = {
 };
 
 export function StatsGrid({ stats }: StatsGridProps) {
-  const columnsClass = stats.length >= 5 ? "xl:grid-cols-5" : "xl:grid-cols-4";
-
   return (
-    <div className={cn("grid gap-3 sm:grid-cols-2", columnsClass)}>
+    <div className="grid gap-3 sm:grid-cols-2 xl:auto-cols-fr xl:grid-flow-col xl:grid-cols-none">
       {stats.map((stat, index) => {
         const Icon = stat.icon;
         const accent = ACCENT_STYLES[index % ACCENT_STYLES.length];
         return (
           <div
             key={stat.label}
-            className="animate-fade-in-up card-hover rounded-xl border bg-card p-4"
+            className="animate-fade-in-up card-hover min-w-0 rounded-xl border bg-card p-4"
             style={{ animationDelay: `${index * 75}ms` }}
           >
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{stat.label}</span>
-              <div className={cn("flex h-8 w-8 items-center justify-center rounded-lg", accent)}>
+              <div className={cn("flex h-8 w-8 shrink-0 items-center justify-center rounded-lg", accent)}>
                 <Icon className="h-4 w-4" aria-hidden="true" />
               </div>
             </div>
             <div className="mt-1">
-              <div data-testid="stat-value-row" className="flex items-baseline gap-2">
+              <div data-testid="stat-value-row" className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
                 <p className="text-[1.625rem] font-semibold tracking-[-0.02em]">{stat.value}</p>
                 {stat.comparison ? (
                   <p className={cn("text-xs font-medium", COMPARISON_STYLES[stat.comparison.tone])}>
@@ -58,7 +56,7 @@ export function StatsGrid({ stats }: StatsGridProps) {
                 ) : null}
               </div>
               {stat.meta ? (
-                <p className="mt-1 text-xs text-muted-foreground">{stat.meta}</p>
+                <p className="mt-1 break-words text-xs text-muted-foreground">{stat.meta}</p>
               ) : null}
             </div>
             {stat.trend.length > 0 ? (

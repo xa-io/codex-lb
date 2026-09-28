@@ -1,11 +1,14 @@
 import { Skeleton } from "@/components/ui/skeleton";
+import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 
 export function DashboardSkeleton() {
+  const showAccountBurnrate = useDashboardPreferencesStore((s) => s.accountBurnrateEnabled);
+
   return (
     <div className="space-y-8">
       {/* Stats grid */}
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, i) => (
+      <div className="grid gap-3 sm:grid-cols-2 xl:auto-cols-fr xl:grid-flow-col xl:grid-cols-none">
+        {Array.from({ length: showAccountBurnrate ? 6 : 5 }).map((_, i) => (
           <div key={i} className="rounded-xl border bg-card p-4">
             <div className="flex items-center justify-between">
               <Skeleton className="h-3 w-20" />
@@ -18,6 +21,47 @@ export function DashboardSkeleton() {
             <Skeleton className="mt-1 h-10 w-full" />
           </div>
         ))}
+      </div>
+
+      {/* Accounts section */}
+      <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <Skeleton className="h-5 w-24" />
+          <div className="h-px flex-1 bg-border" />
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="rounded-xl border bg-card p-4">
+              {/* Header */}
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1.5">
+                  <Skeleton className="h-4 w-36" />
+                </div>
+                <Skeleton className="h-5 w-14 rounded-full" />
+              </div>
+              {/* Quota bars - horizontal 2 columns */}
+              <div className="mt-3.5 grid grid-cols-2 gap-3">
+                {Array.from({ length: 2 }).map((_, j) => (
+                  <div key={j} className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <Skeleton className="h-3 w-16" />
+                      <Skeleton className="h-3 w-10" />
+                    </div>
+                    <Skeleton className="h-1.5 w-full rounded-full" />
+                    <div className="flex items-center gap-1">
+                      <Skeleton className="h-3 w-3 rounded-sm" />
+                      <Skeleton className="h-3 w-20" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {/* Actions */}
+              <div className="mt-3 border-t pt-3">
+                <Skeleton className="h-7 w-16 rounded-lg" />
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Usage donuts + weekly runway card (mirrors the dashboard-page grid slot) */}
@@ -96,47 +140,6 @@ export function DashboardSkeleton() {
               </div>
             </div>
           </div>
-        </div>
-      </div>
-
-      {/* Accounts section */}
-      <div className="space-y-4">
-        <div className="flex items-center gap-3">
-          <Skeleton className="h-5 w-24" />
-          <div className="h-px flex-1 bg-border" />
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="rounded-xl border bg-card p-4">
-              {/* Header */}
-              <div className="flex items-start justify-between gap-3">
-                <div className="space-y-1.5">
-                  <Skeleton className="h-4 w-36" />
-                </div>
-                <Skeleton className="h-5 w-14 rounded-full" />
-              </div>
-              {/* Quota bars - horizontal 2 columns */}
-              <div className="mt-3.5 grid grid-cols-2 gap-3">
-                {Array.from({ length: 2 }).map((_, j) => (
-                  <div key={j} className="space-y-1">
-                    <div className="flex items-center justify-between">
-                      <Skeleton className="h-3 w-16" />
-                      <Skeleton className="h-3 w-10" />
-                    </div>
-                    <Skeleton className="h-1.5 w-full rounded-full" />
-                    <div className="flex items-center gap-1">
-                      <Skeleton className="h-3 w-3 rounded-sm" />
-                      <Skeleton className="h-3 w-20" />
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {/* Actions */}
-              <div className="mt-3 border-t pt-3">
-                <Skeleton className="h-7 w-16 rounded-lg" />
-              </div>
-            </div>
-          ))}
         </div>
       </div>
 
