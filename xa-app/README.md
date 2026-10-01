@@ -20,6 +20,8 @@ xa-app\release\Codex LB\Codex LB.exe
 
 Use `python xa-app\build.py` when you only want to build. Use `--full-tests` to add the complete upstream Python unit suite. `--no-pause` is useful for automation.
 
+If the default release is running, the builder writes a verified sibling folder named `Codex LB staged <timestamp>` and prints its actual application path. It preserves the active app and backend. `--run` defers opening a new release while another release is running; after active sessions finish, close the current app and open the verified executable printed by the build.
+
 Required local tools are Python/uv, Bun, CMake, Visual Studio 2022 Build Tools with the C++ x64 workload, and the Microsoft Edge WebView2 Evergreen Runtime. The builder downloads only the pinned WebView2 SDK package recorded in `dependencies.lock.json` and verifies its SHA-256 before use.
 
 ## What runs

@@ -19,6 +19,51 @@ from app.core.usage.pricing import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "GPT-6.1-SOL", "gpt-6.1-sol-2026-09-30"])
+def test_sol_6_1_alias_cost_is_included_in_summary(model: str) -> None:
+    summary = calculate_costs([CostItem(model=model, usage=UsageTokens(200_000, 10_000, 100_000))])
+    assert summary.total_usd_7d == pytest.approx(0.31)
+    assert len(summary.by_model) == 1
+    assert summary.by_model[0].model == "gpt-6.1-sol"
+    assert summary.by_model[0].usd == pytest.approx(0.31)
+
+
+@pytest.mark.parametrize("tier,multiplier", [(None, 1), ("default", 1), ("flex", 0.5), ("priority", 2), ("fast", 2)])
+@pytest.mark.parametrize(
+    "input_tokens,expected",
+    [(200_000, 0.31), (272_000, 0.454), (272_001, 0.858004), (300_000, 0.97)],
+)
+def test_sol_6_1_cost_context_boundary_and_tiers(
+    tier: str | None, multiplier: float, input_tokens: int, expected: float
+) -> None:
+    resolved = get_pricing_for_model("gpt-6.1-sol")
+    assert resolved is not None
+    _, price = resolved
+    # The context threshold counts cached input as part of total input.
+    cost = calculate_cost_from_usage(UsageTokens(input_tokens, 10_000, 100_000), price, service_tier=tier)
+    assert cost == pytest.approx(expected * multiplier)
+
+
+@pytest.mark.parametrize("tier,multiplier", [(" DEFAULT ", 1), (" FLEX ", 0.5), (" PRIORITY ", 2), (" FAST ", 2)])
+def test_sol_6_1_cost_breakdown_from_response_usage(tier: str, multiplier: float) -> None:
+    resolved = get_pricing_for_model("gpt-6.1-sol")
+    assert resolved is not None
+    _, price = resolved
+    usage = ResponseUsage(
+        input_tokens=1_000,
+        output_tokens=500,
+        input_tokens_details=ResponseUsageDetails(cached_tokens=200),
+    )
+
+    breakdown = calculate_cost_breakdown_from_usage(usage, price, service_tier=tier)
+
+    assert breakdown is not None
+    assert breakdown.input_usd == pytest.approx(0.0016 * multiplier)
+    assert breakdown.cached_input_usd == pytest.approx(0.00002 * multiplier)
+    assert breakdown.output_usd == pytest.approx(0.005 * multiplier)
+    assert breakdown.total_usd == pytest.approx(0.00662 * multiplier)
+
+
 @pytest.mark.parametrize("model", ["gpt-6-astra", "GPT-6-ASTRA", "gpt-6-astra-2026-09-03"])
 def test_astra_alias_cost_is_included_in_summary(model: str) -> None:
     summary = calculate_costs([CostItem(model=model, usage=UsageTokens(200_000, 10_000, 100_000))])

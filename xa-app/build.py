@@ -1,6 +1,6 @@
 ############################################################################################################################
 #
-# CODEX LB NATIVE BUILDER v1.03
+# CODEX LB NATIVE BUILDER v1.04
 #
 # Builds, verifies, and optionally runs the native XA Codex LB Windows application.
 #
@@ -20,13 +20,14 @@
 #
 # Important Note: The release self-test uses an isolated temporary data directory and never imports local credentials.
 #
-# Codex LB Native Builder v1.03
+# Codex LB Native Builder v1.04
 # Native Windows build and verification orchestrator
 # Created by: XA
-# Last Updated: 2026-08-02 20:53:00
+# Last Updated: 2026-09-30
 #
 # ## Release Notes ##
 #
+# v1.04 - Preserved running releases, staged new output safely, and deferred launch while a release is active.
 # v1.03 - Guarded dependency and self-test child-directory cleanup with exact parent and name checks.
 # v1.02 - Preserved and displayed the native JSON self-test report when a packaged runtime check fails.
 # v1.01 - Tightened builder formatting and diagnostics before the first production build.
@@ -189,6 +190,48 @@ def _verify_visual_studio(vswhere: Path) -> Path:
     return install_path
 
 
+def _running_output_processes(directory: Path) -> list[int]:
+    powershell = _find_executable(
+        "powershell.exe",
+        (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe",),
+    )
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "$items = @(Get-CimInstance Win32_Process -Filter "
+        "\"Name = 'Codex LB.exe' OR Name = 'codex-lb-backend.exe'\" "
+        "| Select-Object ProcessId,ExecutablePath); "
+        "ConvertTo-Json -InputObject $items -Compress"
+    )
+    try:
+        result = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        records = json.loads(result.stdout)
+        if not isinstance(records, list):
+            raise ValueError("Process inspection did not return an array")
+        target = directory.resolve()
+        running: list[int] = []
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Invalid process inspection record")
+            executable = record.get("ExecutablePath")
+            pid = record.get("ProcessId")
+            if not isinstance(executable, str) or not executable or type(pid) is not int:
+                raise ValueError("A native process could not be identified")
+            if Path(executable).resolve().is_relative_to(target):
+                running.append(pid)
+        return running
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise BuildError(f"Cannot inspect running native processes; output files were not cleaned: {error}") from error
+
+
 def _safe_clean_directory(path: Path) -> None:
     resolved = path.resolve()
     allowed = {
@@ -198,6 +241,9 @@ def _safe_clean_directory(path: Path) -> None:
     if resolved not in allowed:
         raise BuildError(f"Refusing to clean an unapproved path: {resolved}")
     if resolved.exists():
+        running = _running_output_processes(resolved)
+        if running:
+            raise BuildError(f"Refusing to clean {resolved}: native processes are running (PIDs {running}).")
         print(f"Cleaning {resolved}")
         shutil.rmtree(resolved)
 
@@ -276,9 +322,7 @@ def _download_webview2(lock: dict[str, object]) -> Path:
             shutil.copyfileobj(response, target)
     actual_hash = _sha256(archive)
     if actual_hash != expected_hash:
-        raise BuildError(
-            f"WebView2 SDK SHA-256 mismatch. Expected {expected_hash}, received {actual_hash}."
-        )
+        raise BuildError(f"WebView2 SDK SHA-256 mismatch. Expected {expected_hash}, received {actual_hash}.")
     _safe_remove_generated_child(
         package_dir,
         parent=DEPENDENCIES_DIR,
@@ -396,10 +440,15 @@ def _build_native_host(tools: dict[str, Path], webview_sdk: Path) -> Path:
 
 def _assemble_release(native_executable: Path, backend_bundle: Path, version: str) -> Path:
     _banner("Assembling release")
-    _safe_clean_directory(RELEASE_DIR)
-    RELEASE_DIR.mkdir(parents=True, exist_ok=False)
-    shutil.copy2(native_executable, RELEASE_DIR / "Codex LB.exe")
-    shutil.copytree(backend_bundle, RELEASE_DIR / "backend")
+    release_dir = RELEASE_DIR
+    if _running_output_processes(RELEASE_DIR):
+        release_dir = RELEASE_ROOT / f"Codex LB staged {datetime.now():%Y%m%d-%H%M%S-%f}"
+        print(f"Keeping the running release intact; staging to {release_dir}")
+    else:
+        _safe_clean_directory(RELEASE_DIR)
+    release_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(native_executable, release_dir / "Codex LB.exe")
+    shutil.copytree(backend_bundle, release_dir / "backend")
 
     manifest = {
         "product": "Codex LB",
@@ -409,25 +458,23 @@ def _assemble_release(native_executable: Path, backend_bundle: Path, version: st
         "backend": "backend/codex-lb-backend.exe",
         "built_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sha256": {
-            "Codex LB.exe": _sha256(RELEASE_DIR / "Codex LB.exe"),
-            "backend/codex-lb-backend.exe": _sha256(RELEASE_DIR / "backend" / "codex-lb-backend.exe"),
+            "Codex LB.exe": _sha256(release_dir / "Codex LB.exe"),
+            "backend/codex-lb-backend.exe": _sha256(release_dir / "backend" / "codex-lb-backend.exe"),
         },
     }
-    (RELEASE_DIR / "release-manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
-    _verify_release_contents()
-    return RELEASE_DIR / "Codex LB.exe"
+    (release_dir / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _verify_release_contents(release_dir)
+    return release_dir / "Codex LB.exe"
 
 
-def _verify_release_contents() -> None:
-    found = [path for path in RELEASE_DIR.rglob("*") if path.name.casefold() in PROHIBITED_RELEASE_NAMES]
+def _verify_release_contents(release_dir: Path) -> None:
+    found = [path for path in release_dir.rglob("*") if path.name.casefold() in PROHIBITED_RELEASE_NAMES]
     if found:
         rendered = "\n".join(f"  - {path}" for path in found)
         raise BuildError(f"Credential or local data files were found in the release:\n{rendered}")
-    if not (RELEASE_DIR / "Codex LB.exe").is_file():
+    if not (release_dir / "Codex LB.exe").is_file():
         raise BuildError("The native release entry point is missing.")
-    if not (RELEASE_DIR / "backend" / "codex-lb-backend.exe").is_file():
+    if not (release_dir / "backend" / "codex-lb-backend.exe").is_file():
         raise BuildError("The bundled backend entry point is missing.")
 
 
@@ -485,6 +532,13 @@ def _launch(executable: Path) -> None:
     print(f"Launched: {executable}")
 
 
+def _launch_verified_release(executable: Path) -> None:
+    if _running_output_processes(RELEASE_ROOT):
+        print(f"Launch deferred while another release is running. Open this after closing the active app: {executable}")
+        return
+    _launch(executable)
+
+
 def build(*, run_after: bool, full_tests: bool) -> Path:
     os.chdir(REPO_ROOT)
     _banner("Codex LB native Windows build")
@@ -509,12 +563,12 @@ def build(*, run_after: bool, full_tests: bool) -> Path:
 
     _banner("BUILD SUCCESSFUL")
     print(f"Application: {release_executable}")
-    print(f"Backend:     {RELEASE_DIR / 'backend' / 'codex-lb-backend.exe'}")
+    print(f"Backend:     {release_executable.parent / 'backend' / 'codex-lb-backend.exe'}")
     print(f"Self-test:   {self_test_report}")
     print("Data:        %USERPROFILE%\\.codex-lb")
     print("The visible application is Codex LB.exe; the backend has no window by design.")
     if run_after:
-        _launch(release_executable)
+        _launch_verified_release(release_executable)
     return release_executable
 
 
