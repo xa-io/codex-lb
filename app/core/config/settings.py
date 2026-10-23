@@ -99,7 +99,6 @@ _REMOVED_SETTINGS: tuple[str, ...] = (
     "CODEX_LB_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
     "CODEX_LB_CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS",
     "CODEX_LB_MEMORY_WARNING_THRESHOLD_MB",
-    "CODEX_LB_IMAGES_HOST_MODEL",
     "CODEX_LB_IMAGES_MAX_PARTIAL_IMAGES",
     # Phase 3 (reduce-settings-surface-phase-3)
     "CODEX_LB_DATABASE_BACKGROUND_POOL_SIZE",
@@ -417,9 +416,9 @@ class Settings(BaseSettings):
     # OpenAI Images API compatibility (POST /v1/images/{generations,edits})
     # ``images_default_model`` is the public model returned to clients when
     # they omit ``model``; it must remain in the ``gpt-image-*`` family. The
-    # internal Responses host model used to invoke the ``image_generation``
-    # tool is a fixed constant in ``app/modules/proxy/api.py``.
+    # internal Responses host is configured separately from the image renderer.
     images_default_model: str = "gpt-image-2"
+    images_host_model: str = Field(default="gpt-6-astra", min_length=1, pattern=r"^\S+$")
     # NOTE: there is intentionally no ``images_max_n`` setting. The
     # upstream ``image_generation`` tool path accepts only a single
     # image per call and codex-lb does not yet implement client-side

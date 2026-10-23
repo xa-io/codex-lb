@@ -258,14 +258,7 @@ Phase 2 (15 removed):
   anyway. `CODEX_LB_MEMORY_REJECT_THRESHOLD_MB` stays: it is the one
   genuine deployment decision (it depends on host memory size), default 0
   = fully off.
-- Images internals (2): host model fixed to `gpt-5.5`
-  (`_IMAGES_HOST_MODEL` in `app/modules/proxy/api.py`; the model registry
-  has no "default Responses model" concept, so a documented constant
-  tracking the bootstrap catalog beats inventing registry plumbing —
-  never echoed to clients) and partial-images cap fixed to 3 in
-  `app/core/openai/images.py` (an upstream streaming contract).
-  `CODEX_LB_IMAGES_DEFAULT_MODEL` stays: the public API contract for
-  clients that omit `model`.
+- Images internals: the partial-images cap remains fixed to 3 in `app/core/openai/images.py` (an upstream streaming contract). `CODEX_LB_IMAGES_HOST_MODEL` is restored with default `gpt-6-astra`: a fixed retired host can reject every account before the image tool runs, and deployments need to select a host available in their account catalogs. It is separate from `CODEX_LB_IMAGES_DEFAULT_MODEL`, the public renderer used when clients omit `model`; host selection does not change public model policy or accounting.
 
 Phase 3 (10 removed):
 

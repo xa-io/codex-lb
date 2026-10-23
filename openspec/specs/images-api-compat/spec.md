@@ -5,6 +5,21 @@ Define the OpenAI-compatible Images API adapter that exposes public `gpt-image-*
 requests while routing through the existing Responses `image_generation` tool
 pipeline.
 ## Requirements
+### Requirement: Configurable image host model
+
+The system SHALL select the internal Responses host for image generation and editing from `CODEX_LB_IMAGES_HOST_MODEL`, defaulting to `gpt-6-astra`. This setting MUST NOT replace the requested public `gpt-image-*` renderer, weaken account eligibility checks, or change public model policy and accounting. The setting MUST apply equally to `/v1/images/*` and `/backend-api/codex/images/*` aliases.
+
+#### Scenario: Configured host preserves the image renderer
+
+- **WHEN** the deployment selects an eligible Responses host and a client requests an image renderer
+- **THEN** the upstream Responses request uses that configured host
+- **AND** the `image_generation` tool retains the requested renderer and image parameters
+
+#### Scenario: Unavailable configured host fails explicitly
+
+- **WHEN** no account supports the configured host
+- **THEN** the existing model-eligibility error is returned without silently substituting another host or image renderer
+
 ### Requirement: OpenAI-compatible image generation endpoint
 
 The system SHALL expose `POST /v1/images/generations` and accept the OpenAI Images API request shape (`model`, `prompt`, `n`, `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `partial_images`, `stream`, `user`). The endpoint MUST require `model` to start with `gpt-image-` and MUST treat `gpt-image-2` as the default if unspecified. The endpoint MUST NOT expose the internal "host" Responses model used to invoke the built-in `image_generation` tool.

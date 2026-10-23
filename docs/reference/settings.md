@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 133 settings. Every setting is an environment
+codex-lb currently exposes 134 settings. Every setting is an environment
 variable with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process). All defaults work with zero configuration —
 start from [Configuration](../configuration.md) for the handful that matter,
@@ -183,6 +183,7 @@ the env-file locations have to be known before env files are read.
 | `CODEX_LB_IMAGE_INLINE_ALLOWED_HOSTS` | `list[str]` | `[]` |
 | `CODEX_LB_IMAGE_INLINE_FETCH_ENABLED` | `bool` | `True` |
 | `CODEX_LB_IMAGES_DEFAULT_MODEL` | `str` | `'gpt-image-2'` |
+| `CODEX_LB_IMAGES_HOST_MODEL` | `str` | `'gpt-6-astra'` |
 
 ## Model registry
 
@@ -316,7 +317,6 @@ issue [#1340](https://github.com/Soju06/codex-lb/issues/1340)):
 - `CODEX_LB_CIRCUIT_BREAKER_FAILURE_THRESHOLD`
 - `CODEX_LB_CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS`
 - `CODEX_LB_MEMORY_WARNING_THRESHOLD_MB`
-- `CODEX_LB_IMAGES_HOST_MODEL`
 - `CODEX_LB_IMAGES_MAX_PARTIAL_IMAGES`
 - `CODEX_LB_DATABASE_BACKGROUND_POOL_SIZE`
 - `CODEX_LB_DATABASE_BACKGROUND_MAX_OVERFLOW`

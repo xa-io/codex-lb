@@ -310,7 +310,10 @@ async def test_images_generations_no_accounts_returns_5xx(async_client):
 
 
 @pytest.mark.asyncio
-async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog):
+@pytest.mark.parametrize("host_model", ["gpt-6-astra", "gpt-5.5"])
+@pytest.mark.parametrize("route", ["/v1/images/generations", "/backend-api/codex/images/generations"])
+async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog, host_model, route):
+    monkeypatch.setattr(proxy_module.get_settings(), "images_host_model", host_model)
     await _import_account(async_client, "acc_images_basic", "img-basic@example.com")
 
     captured: dict[str, object] = {}
@@ -360,7 +363,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
 
     with caplog.at_level(logging.INFO, logger="app.modules.proxy.api"):
         response = await async_client.post(
-            "/v1/images/generations",
+            route,
             json={
                 "model": "gpt-image-2",
                 "prompt": "tiny red circle on white",
@@ -377,7 +380,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
     assert body["usage"] == {"input_tokens": 7, "output_tokens": 13, "total_tokens": 20}
 
     # The host model is hidden from clients but appears in the upstream call.
-    assert captured["model"] == "gpt-5.5"
+    assert captured["model"] == host_model
     tools = cast(list[Any], captured["tools"])
     image_tool = cast(dict[str, Any], tools[0])
     assert image_tool["type"] == "image_generation"
@@ -1029,7 +1032,9 @@ async def test_backend_codex_images_edits_invalid_utf8_returns_400(async_client,
 
 
 @pytest.mark.asyncio
-async def test_images_edits_basic_round_trip(async_client, monkeypatch):
+@pytest.mark.parametrize("host_model", ["gpt-6-astra", "gpt-5.5"])
+async def test_images_edits_basic_round_trip(async_client, monkeypatch, host_model):
+    monkeypatch.setattr(proxy_module.get_settings(), "images_host_model", host_model)
     await _import_account(async_client, "acc_images_edit", "img-edit@example.com")
 
     captured: dict[str, object] = {}
@@ -1039,6 +1044,7 @@ async def test_images_edits_basic_round_trip(async_client, monkeypatch):
         captured["input"] = payload.input
         captured["tools"] = list(payload.tools)
         captured["account_id"] = account_id
+        captured["model"] = payload.model
         yield _sse(
             {
                 "type": "response.output_item.done",
@@ -1081,6 +1087,9 @@ async def test_images_edits_basic_round_trip(async_client, monkeypatch):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["data"] == [{"b64_json": "EDITED_B64", "revised_prompt": "edited"}]
+    assert captured["model"] == host_model
+    image_tools = cast(list[dict[str, Any]], captured["tools"])
+    assert image_tools[0]["model"] == "gpt-image-1"
 
     # Verify the upstream payload contained the image as an input_image data
     # URL alongside the prompt text.

@@ -89,7 +89,7 @@ def test_warn_removed_settings_scans_env_files(tmp_path, monkeypatch, caplog):
 
 
 def test_removed_settings_tuple_covers_all_five_groups():
-    assert len(_REMOVED_SETTINGS) == 52
+    assert len(_REMOVED_SETTINGS) == 51
     assert all(name.startswith("CODEX_LB_") for name in _REMOVED_SETTINGS)
     assert len(set(_REMOVED_SETTINGS)) == len(_REMOVED_SETTINGS)
 
@@ -109,7 +109,6 @@ def test_phase_2_removed_settings_are_listed_and_ignored(monkeypatch):
         "CODEX_LB_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
         "CODEX_LB_CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS",
         "CODEX_LB_MEMORY_WARNING_THRESHOLD_MB",
-        "CODEX_LB_IMAGES_HOST_MODEL",
         "CODEX_LB_IMAGES_MAX_PARTIAL_IMAGES",
     )
     for name in phase_2_names:
@@ -119,7 +118,7 @@ def test_phase_2_removed_settings_are_listed_and_ignored(monkeypatch):
     monkeypatch.setenv("CODEX_LB_IMAGES_HOST_MODEL", "gpt-5.6")
     settings = Settings()
     assert not hasattr(settings, "quota_planner_tick_seconds")
-    assert not hasattr(settings, "images_host_model")
+    assert settings.images_host_model == "gpt-5.6"
     found = warn_removed_settings(
         {
             "CODEX_LB_QUOTA_PLANNER_TICK_SECONDS": "60",
@@ -128,7 +127,6 @@ def test_phase_2_removed_settings_are_listed_and_ignored(monkeypatch):
     )
     assert found == [
         "CODEX_LB_QUOTA_PLANNER_TICK_SECONDS",
-        "CODEX_LB_IMAGES_HOST_MODEL",
     ]
 
 

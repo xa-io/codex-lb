@@ -323,12 +323,10 @@ enable switches.
 
 #### Scenario: Removed scheduler and images env vars are ignored with one startup warning
 
-- **GIVEN** a deployment whose environment still sets removed settings such
-  as `CODEX_LB_QUOTA_PLANNER_TICK_SECONDS` and `CODEX_LB_IMAGES_HOST_MODEL`
+- **GIVEN** a deployment whose environment still sets removed settings such as `CODEX_LB_QUOTA_PLANNER_TICK_SECONDS` and `CODEX_LB_IMAGES_MAX_PARTIAL_IMAGES`
 - **WHEN** the application starts
 - **THEN** startup succeeds and the fixed built-in values are used
-- **AND** exactly one warning log lists both removed names without their
-  values
+- **AND** exactly one warning log lists both removed names without their values
 
 #### Scenario: Memory warning threshold derives from the reject threshold
 
